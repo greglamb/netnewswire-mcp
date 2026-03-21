@@ -1,6 +1,6 @@
 {
-  "name": "netnewswire-mcp",
-  "version": "0.1.0",
+  "name": "@jellllly/netnewswire-mcp",
+  "version": "0.1.1",
   "description": "MCP server for NetNewsWire — interact with your RSS feeds from Claude",
   "type": "module",
   "bin": {

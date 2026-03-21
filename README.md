@@ -36,14 +36,14 @@ Then add to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 }
 ```
 
-### Option 3: npx (after publishing to npm)
+### Option 3: npx
 
 ```json
 {
   "mcpServers": {
     "netnewswire": {
       "command": "npx",
-      "args": ["netnewswire-mcp"]
+      "args": ["@jellllly/netnewswire-mcp"]
     }
   }
 }
