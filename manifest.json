@@ -12,7 +12,6 @@
     "type": "git",
     "url": "https://github.com/jelly/netnewswire-mcp.git"
   },
-  "icon": "docs/logo.png",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
