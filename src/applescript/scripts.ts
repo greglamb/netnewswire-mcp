@@ -205,6 +205,18 @@ end tell`,
 
   /**
    * Mark articles as read/unread or starred/unstarred.
+   *
+   * Performance notes (fixes #2, #4):
+   * - Uses a `whose` clause so NetNewsWire performs the ID filter natively,
+   *   instead of issuing one Apple Event per article across the IPC boundary.
+   * - Early-exits as soon as every requested ID has been matched, so we
+   *   don't keep scanning feeds we no longer need to look at.
+   * - Wraps in `with timeout` so individual Apple Events don't fail with
+   *   a -1712 default-timeout error on large libraries.
+   *
+   * The `whose ... or ...` chain is preferred over `whose id is in {...}`
+   * because NetNewsWire's scripting layer does not implement the `is in`
+   * membership operator for `id` and silently returns no matches.
    */
   markArticles: (
     articleIds: string[],
@@ -212,22 +224,29 @@ end tell`,
   ) => {
     const property = action === "read" || action === "unread" ? "read" : "starred";
     const value = action === "read" || action === "starred" ? "true" : "false";
-    const idChecks = articleIds
-      .map((id) => `id of a is "${escapeForAppleScript(id)}"`)
+    // Build a single predicate evaluated by NetNewsWire (one IPC per feed).
+    const whereClause = articleIds
+      .map((id) => `id is "${escapeForAppleScript(id)}"`)
       .join(" or ");
     return `
 tell application "NetNewsWire"
+  set totalIds to ${articleIds.length}
   set matchCount to 0
-  repeat with acct in every account
-    repeat with nthFeed in allFeeds of acct
-      repeat with a in every article of nthFeed
-        if ${idChecks} then
-          set ${property} of a to ${value}
-          set matchCount to matchCount + 1
-        end if
+  with timeout of 300 seconds
+    repeat with acct in every account
+      if matchCount ≥ totalIds then exit repeat
+      repeat with nthFeed in allFeeds of acct
+        if matchCount ≥ totalIds then exit repeat
+        try
+          set matched to (every article of nthFeed whose (${whereClause}))
+          repeat with a in matched
+            set ${property} of a to ${value}
+            set matchCount to matchCount + 1
+          end repeat
+        end try
       end repeat
     end repeat
-  end repeat
+  end timeout
   return "MARKED:" & matchCount
 end tell`;
   },
