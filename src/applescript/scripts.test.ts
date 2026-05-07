@@ -183,11 +183,32 @@ describe("scripts.listFeeds", () => {
     expect(s).toContain('whose name is "Acct \\"X\\""');
   });
 
-  it("emits ACCOUNT/FOLDER/FEED record prefixes the parser expects", () => {
+  it("emits ACCOUNT/FOLDER/FEED record tags the parser expects", () => {
     const s = scripts.listFeeds();
-    expect(s).toContain('"ACCOUNT:"');
-    expect(s).toContain('"FOLDER:"');
-    expect(s).toContain('"FEED:"');
+    // Records start with the tag followed by `& US` — the unit-separator
+    // delimiter — instead of the old `"TAG:"` prefix.
+    expect(s).toMatch(/"ACCOUNT" & US/);
+    expect(s).toMatch(/"FOLDER" & US/);
+    expect(s).toMatch(/"FEED" & US/);
+  });
+
+  it("strips RS/US from name/url/homepage values via my stripSep", () => {
+    // Without this, a `|` or newline in a feed name would have escaped
+    // through to the JS parser. This test locks in that the stripSep
+    // helper is wired in at every emission site for user-controlled
+    // strings.
+    const s = scripts.listFeeds();
+    expect(s).toContain("my stripSep(name of acct)");
+    expect(s).toContain("my stripSep(name of f)");
+    expect(s).toContain("my stripSep(url of f)");
+    expect(s).toContain("my stripSep(homepage url of f)");
+    expect(s).toContain("my stripSep(name of fld)");
+  });
+
+  it("includes the stripSep handler definition", () => {
+    const s = scripts.listFeeds();
+    expect(s).toContain("on stripSep(s)");
+    expect(s).toContain("end stripSep");
   });
 });
 
@@ -227,16 +248,51 @@ describe("scripts.getArticles", () => {
     expect(s).toContain('if url of nthFeed is "https://e.com/\\"x\\""');
   });
 
-  it("emits the ARTICLE: record prefix the parser expects", () => {
+  it("emits the ARTICLE record tag the parser expects", () => {
     const s = scripts.getArticles({});
-    expect(s).toContain('"ARTICLE:"');
+    expect(s).toMatch(/"ARTICLE" & US/);
+  });
+
+  it("strips RS/US from user-controlled article fields", () => {
+    // Article titles, URLs, summaries are user data and frequently
+    // contain `|`. Locking in stripSep on every such field prevents
+    // the old pipe-delimiter corruption from coming back.
+    const s = scripts.getArticles({});
+    expect(s).toContain("my stripSep(id of a)");
+    expect(s).toContain("my stripSep(title of a)");
+    expect(s).toContain("my stripSep(url of a)");
+    expect(s).toContain("my stripSep(summary of a)");
+    expect(s).toContain("my stripSep(name of feed of a)");
   });
 });
 
 describe("scripts.readArticle", () => {
-  it("matches by article id", () => {
+  it("matches by article id using a `whose` clause for native filtering", () => {
+    // Pre-rewrite, this script walked every article with a per-article
+    // `if id of a is "..."` check — the same shape that caused the
+    // markArticles timeout (#2/#4). The whose-clause pushdown is the fix.
     const s = scripts.readArticle("abc-123");
-    expect(s).toContain('if id of a is "abc-123"');
+    expect(s).toContain('every article of nthFeed whose id is "abc-123"');
+  });
+
+  it("does NOT walk articles with a per-article `if id of a is` check", () => {
+    // Regression guard: any future cleanup that re-introduces
+    // per-article id comparison brings back the timeout bug.
+    const s = scripts.readArticle("abc");
+    expect(s).not.toMatch(/repeat with a in every article[\s\S]*if id of a is/);
+  });
+
+  it("wraps the work in `with timeout of 300 seconds`", () => {
+    const s = scripts.readArticle("abc");
+    expect(s).toContain("with timeout of 300 seconds");
+    expect(s).toContain("end timeout");
+  });
+
+  it("rethrows the systemic Apple Event error codes", () => {
+    const s = scripts.readArticle("abc");
+    for (const code of [-128, -600, -609, -1712, -1743]) {
+      expect(s).toContain(`errNum is ${code}`);
+    }
   });
 
   it("returns ERROR:Article not found when no match exists", () => {
@@ -246,19 +302,42 @@ describe("scripts.readArticle", () => {
 
   it("escapes special characters in the article ID", () => {
     const s = scripts.readArticle('a"b');
-    expect(s).toContain('if id of a is "a\\"b"');
+    expect(s).toContain('whose id is "a\\"b"');
   });
 
-  it("emits all field prefixes the parseFullArticle parser expects", () => {
+  it("emits all field tags the parseFullArticle parser expects", () => {
     const s = scripts.readArticle("x");
-    for (const prefix of ["TITLE:", "URL:", "FEED:", "DATE:", "READ:", "STARRED:", "AUTHORS:", "SUMMARY:", "HTML:", "TEXT:"]) {
-      expect(s).toContain(`"${prefix}"`);
+    for (const tag of [
+      "TITLE",
+      "URL",
+      "FEED",
+      "DATE",
+      "READ",
+      "STARRED",
+      "AUTHORS",
+      "SUMMARY",
+      "HTML",
+      "TEXT",
+    ]) {
+      // Each field is now `"TAG" & US & value & RS` — that single record
+      // shape is what the parser keys on.
+      expect(s).toMatch(new RegExp(`"${tag}" & US`));
     }
+  });
+
+  it("strips RS/US from user-controlled article fields", () => {
+    const s = scripts.readArticle("x");
+    expect(s).toContain("my stripSep(title of a)");
+    expect(s).toContain("my stripSep(url of a)");
+    expect(s).toContain("my stripSep(html of a)");
+    expect(s).toContain("my stripSep(contents of a)");
+    expect(s).toContain("my stripSep(summary of a)");
+    expect(s).toContain("my stripSep(name of feed of a)");
   });
 });
 
 describe("scripts.subscribe", () => {
-  it("subscribes at the first account when no folder is given", () => {
+  it("subscribes at the first account when no folder or account is given", () => {
     const s = scripts.subscribe("https://example.com/feed.xml");
     expect(s).toContain(
       'make new feed at first account with properties {url:"https://example.com/feed.xml"}'
@@ -273,13 +352,52 @@ describe("scripts.subscribe", () => {
     );
   });
 
+  it("scopes folder lookup to the named account when both are given", () => {
+    // Without the account scope, the first matching folder wins across
+    // all accounts — surprising when "Tech" exists in both Feedbin and
+    // On My Mac. Locking in that account narrows the search.
+    const s = scripts.subscribe(
+      "https://example.com/feed.xml",
+      "Tech",
+      "Feedbin"
+    );
+    expect(s).toContain('every account whose name is "Feedbin"');
+    expect(s).toContain('if name of fld is "Tech"');
+  });
+
+  it("subscribes at top-level of a named account when no folder is given", () => {
+    const s = scripts.subscribe(
+      "https://example.com/feed.xml",
+      undefined,
+      "On My Mac"
+    );
+    expect(s).toContain('every account whose name is "On My Mac"');
+    expect(s).toContain(
+      'make new feed at acct with properties {url:"https://example.com/feed.xml"}'
+    );
+  });
+
   it("returns ERROR:Folder not found if the named folder doesn't exist", () => {
     const s = scripts.subscribe("https://example.com/feed.xml", "Missing");
     expect(s).toContain('return "ERROR:Folder not found"');
   });
 
-  it("escapes URLs and folder names containing quotes", () => {
-    const s = scripts.subscribe('https://e.com/"x"', 'Bad "Folder"');
+  it("returns ERROR:Account not found if the named account doesn't exist", () => {
+    const s = scripts.subscribe(
+      "https://example.com/feed.xml",
+      undefined,
+      "Missing"
+    );
+    expect(s).toContain('return "ERROR:Account not found"');
+  });
+
+  it("escapes URLs, folder, and account names containing quotes", () => {
+    const s = scripts.subscribe(
+      'https://e.com/"x"',
+      'Bad "Folder"',
+      'Bad "Acct"'
+    );
+    expect(s).toContain('every account whose name is "Bad \\"Acct\\""');
     expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
     expect(s).toContain(
       'make new feed at fld with properties {url:"https://e.com/\\"x\\""}'
@@ -298,9 +416,32 @@ describe("scripts.searchArticles", () => {
     expect(s).toContain('set searchTerm to "AI agents"');
   });
 
-  it("checks both title and contents for the search term", () => {
+  it("pushes the keyword filter into NetNewsWire via a `whose` clause", () => {
+    // The pre-rewrite script did the contains check in JS-side
+    // AppleScript via per-article repeat — that's the same shape that
+    // bottlenecked markArticles. Native filtering inside NNW is the fix.
     const s = scripts.searchArticles("foo");
-    expect(s).toContain("aTitle contains searchTerm or aText contains searchTerm");
+    expect(s).toContain(
+      "every article of nthFeed whose (title contains searchTerm) or (contents contains searchTerm)"
+    );
+  });
+
+  it("does NOT fall back to per-article `repeat with a in every article`", () => {
+    const s = scripts.searchArticles("foo");
+    expect(s).not.toMatch(/repeat with a in every article of nthFeed/);
+  });
+
+  it("wraps the work in `with timeout of 300 seconds`", () => {
+    const s = scripts.searchArticles("foo");
+    expect(s).toContain("with timeout of 300 seconds");
+    expect(s).toContain("end timeout");
+  });
+
+  it("rethrows the systemic Apple Event error codes", () => {
+    const s = scripts.searchArticles("foo");
+    for (const code of [-128, -600, -609, -1712, -1743]) {
+      expect(s).toContain(`errNum is ${code}`);
+    }
   });
 
   it("respects an explicit limit", () => {
@@ -318,9 +459,281 @@ describe("scripts.searchArticles", () => {
     expect(s).toContain('set searchTerm to "say \\"hi\\""');
   });
 
-  it("early-exits the article loop once the limit is reached", () => {
+  it("early-exits the search once the limit is reached", () => {
     const s = scripts.searchArticles("foo", 5);
     expect(s).toContain("if matchCount ≥ maxResults then exit repeat");
+  });
+
+  it("strips RS/US from user-controlled article fields", () => {
+    const s = scripts.searchArticles("foo");
+    expect(s).toContain("my stripSep(id of a)");
+    expect(s).toContain("my stripSep(title of a)");
+    expect(s).toContain("my stripSep(url of a)");
+    expect(s).toContain("my stripSep(name of feed of a)");
+  });
+});
+
+describe("scripts.createFolder", () => {
+  it("scopes to a named account when accountName is given", () => {
+    const s = scripts.createFolder("Tech", "On My Mac");
+    expect(s).toContain('every account whose name is "On My Mac"');
+  });
+
+  it("does not filter accounts when no accountName is given", () => {
+    const s = scripts.createFolder("Tech");
+    expect(s).toContain("every account ");
+    expect(s).not.toContain("whose name is");
+  });
+
+  it("issues `make new folder` with the given name", () => {
+    const s = scripts.createFolder("Tech");
+    expect(s).toContain(
+      'make new folder at targetAcct with properties {name:"Tech"}'
+    );
+  });
+
+  it("returns ERROR:Account not found when no account matches", () => {
+    const s = scripts.createFolder("Tech", "Missing");
+    expect(s).toContain('return "ERROR:Account not found"');
+  });
+
+  it("checks for a duplicate folder before creating", () => {
+    // Without this guard, NNW would happily make a second same-named folder,
+    // which is confusing and hard to recover from.
+    const s = scripts.createFolder("Tech");
+    expect(s).toContain('if name of fld is "Tech"');
+    expect(s).toContain('return "ERROR:Folder already exists"');
+  });
+
+  it("escapes folder names containing quotes", () => {
+    const s = scripts.createFolder('Bad "Folder"');
+    expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
+    expect(s).toContain(
+      'make new folder at targetAcct with properties {name:"Bad \\"Folder\\""}'
+    );
+  });
+
+  it("returns the OK sentinel on success", () => {
+    const s = scripts.createFolder("Tech");
+    expect(s).toContain('return "OK"');
+  });
+});
+
+describe("scripts.deleteFolder", () => {
+  it("scopes to a named account when accountName is given", () => {
+    const s = scripts.deleteFolder("Tech", "On My Mac");
+    expect(s).toContain('every account whose name is "On My Mac"');
+  });
+
+  it("matches the folder by name", () => {
+    const s = scripts.deleteFolder("Tech");
+    expect(s).toContain('if name of fld is "Tech"');
+  });
+
+  it("refuses to delete a non-empty folder and reports the feed count", () => {
+    const s = scripts.deleteFolder("Tech");
+    expect(s).toContain("set feedCount to count of feeds of fld");
+    expect(s).toContain("if feedCount > 0 then");
+    expect(s).toContain('"ERROR:Folder not empty ("');
+    // Critical: the empty-check must precede `delete fld`, otherwise the
+    // refusal is meaningless.
+    const checkIdx = s.indexOf("if feedCount > 0 then");
+    const deleteIdx = s.indexOf("delete fld");
+    expect(checkIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(checkIdx);
+  });
+
+  it("returns ERROR:Folder not found when no folder matches", () => {
+    const s = scripts.deleteFolder("Missing");
+    expect(s).toContain('return "ERROR:Folder not found"');
+  });
+
+  it("escapes folder names containing quotes", () => {
+    const s = scripts.deleteFolder('Bad "Folder"');
+    expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
+  });
+});
+
+describe("scripts.deleteFeed", () => {
+  it("matches the feed by URL", () => {
+    const s = scripts.deleteFeed("https://example.com/feed.xml");
+    expect(s).toContain('if url of f is "https://example.com/feed.xml"');
+  });
+
+  it("searches both top-level feeds AND feeds inside folders", () => {
+    // A feed-by-URL lookup must cover both locations or we'll silently fail
+    // to delete feeds that happen to live inside a folder.
+    const s = scripts.deleteFeed("https://example.com/feed.xml");
+    expect(s).toContain("repeat with f in every feed of acct");
+    expect(s).toContain("repeat with f in every feed of fld");
+  });
+
+  it("returns ERROR:Feed not found when no feed matches", () => {
+    const s = scripts.deleteFeed("https://nope.example/feed.xml");
+    expect(s).toContain('return "ERROR:Feed not found"');
+  });
+
+  it("escapes URLs containing quotes", () => {
+    const s = scripts.deleteFeed('https://e.com/"x"');
+    expect(s).toContain('if url of f is "https://e.com/\\"x\\""');
+  });
+
+  it("issues a `delete f` on match", () => {
+    const s = scripts.deleteFeed("https://example.com/feed.xml");
+    expect(s).toContain("delete f");
+  });
+});
+
+describe("scripts.moveFeed", () => {
+  it("matches the source feed by URL across both top-level and folders", () => {
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain('if url of f is "https://example.com/feed.xml"');
+    expect(s).toContain("repeat with f in every feed of acct");
+    expect(s).toContain("repeat with f in every feed of fld");
+  });
+
+  it("returns ERROR:Feed not found when the source feed is missing", () => {
+    const s = scripts.moveFeed("https://nope.example/feed.xml", "Tech");
+    expect(s).toContain('return "ERROR:Feed not found"');
+  });
+
+  it("validates the target folder BEFORE deleting the source feed", () => {
+    // The whole point: if we fail to find the destination, we must not
+    // have already deleted the feed. Order is load-bearing.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    const targetMissingIdx = s.indexOf('"ERROR:Target folder not found"');
+    const deleteIdx = s.indexOf("delete srcFeed");
+    expect(targetMissingIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(-1);
+    expect(targetMissingIdx).toBeLessThan(deleteIdx);
+  });
+
+  it("scopes the target folder lookup to the SOURCE feed's account", () => {
+    // Folders aren't shared across accounts; the destination must be in
+    // the same account as the feed we're moving.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain("repeat with fld in every folder of srcAcct");
+  });
+
+  it("re-subscribes inside the target folder when one is given", () => {
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain('if name of fld is "Tech"');
+    expect(s).toContain(
+      'make new feed at targetFolder with properties {url:"https://example.com/feed.xml"}'
+    );
+  });
+
+  it("re-subscribes at the account top level when no target folder is given", () => {
+    const s = scripts.moveFeed("https://example.com/feed.xml");
+    expect(s).toContain(
+      'make new feed at srcAcct with properties {url:"https://example.com/feed.xml"}'
+    );
+    // And it must NOT try to look up a folder in that case.
+    expect(s).not.toContain('if name of fld is ""');
+  });
+
+  it("escapes URLs and folder names containing quotes", () => {
+    const s = scripts.moveFeed('https://e.com/"x"', 'Bad "Folder"');
+    expect(s).toContain('if url of f is "https://e.com/\\"x\\""');
+    expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
+  });
+});
+
+describe("scripts.exportOpml", () => {
+  describe("feed scope", () => {
+    it("matches the feed by URL across top-level and folders", () => {
+      const s = scripts.exportOpml({ feedUrl: "https://example.com/feed.xml" });
+      expect(s).toContain('if url of f is "https://example.com/feed.xml"');
+      expect(s).toContain("repeat with f in every feed of acct");
+      expect(s).toContain("repeat with f in every feed of fld");
+    });
+
+    it("returns the feed's opml representation on match", () => {
+      const s = scripts.exportOpml({ feedUrl: "https://example.com/feed.xml" });
+      expect(s).toContain("return opml representation of f");
+    });
+
+    it("returns ERROR:Feed not found when no feed matches", () => {
+      const s = scripts.exportOpml({ feedUrl: "https://nope.example/feed.xml" });
+      expect(s).toContain('return "ERROR:Feed not found"');
+    });
+
+    it("escapes URLs containing quotes", () => {
+      const s = scripts.exportOpml({ feedUrl: 'https://e.com/"x"' });
+      expect(s).toContain('if url of f is "https://e.com/\\"x\\""');
+    });
+  });
+
+  describe("folder scope", () => {
+    it("matches the folder by name", () => {
+      const s = scripts.exportOpml({ folderName: "Tech" });
+      expect(s).toContain('if name of fld is "Tech"');
+      expect(s).toContain("return opml representation of fld");
+    });
+
+    it("scopes the lookup to a named account when given", () => {
+      const s = scripts.exportOpml({
+        folderName: "Tech",
+        accountName: "On My Mac",
+      });
+      expect(s).toContain('every account whose name is "On My Mac"');
+    });
+
+    it("walks every account when accountName is omitted", () => {
+      const s = scripts.exportOpml({ folderName: "Tech" });
+      expect(s).toContain("every account ");
+      expect(s).not.toContain("whose name is");
+    });
+
+    it("returns ERROR:Folder not found when no folder matches", () => {
+      const s = scripts.exportOpml({ folderName: "Missing" });
+      expect(s).toContain('return "ERROR:Folder not found"');
+    });
+
+    it("escapes folder and account names containing quotes", () => {
+      const s = scripts.exportOpml({
+        folderName: 'Bad "Folder"',
+        accountName: 'Acct "X"',
+      });
+      expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
+      expect(s).toContain('every account whose name is "Acct \\"X\\""');
+    });
+
+    it("prefers the feed branch over the folder branch when both are given", () => {
+      // Precedence is feed > folder > account. The folder branch's
+      // distinguishing string must NOT appear when feedUrl is set.
+      const s = scripts.exportOpml({
+        feedUrl: "https://example.com/feed.xml",
+        folderName: "Tech",
+      });
+      expect(s).not.toContain('if name of fld is "Tech"');
+      expect(s).toContain('if url of f is "https://example.com/feed.xml"');
+    });
+  });
+
+  describe("account scope", () => {
+    it("returns the OPML of the named account when accountName is given", () => {
+      const s = scripts.exportOpml({ accountName: "Feedbin" });
+      expect(s).toContain('every account whose name is "Feedbin"');
+      expect(s).toContain("return opml representation of acct");
+    });
+
+    it("falls back to the first account when no target is given", () => {
+      const s = scripts.exportOpml({});
+      expect(s).toContain("repeat with acct in every account");
+      expect(s).toContain("return opml representation of acct");
+      expect(s).not.toContain("whose name is");
+    });
+
+    it("returns ERROR:Account not found when no account matches", () => {
+      const s = scripts.exportOpml({ accountName: "Missing" });
+      expect(s).toContain('return "ERROR:Account not found"');
+    });
+
+    it("escapes account names containing quotes", () => {
+      const s = scripts.exportOpml({ accountName: 'Acct "X"' });
+      expect(s).toContain('every account whose name is "Acct \\"X\\""');
+    });
   });
 });
 
@@ -334,5 +747,31 @@ describe("scripts.getCurrentArticle", () => {
   it("references `current article` of the application", () => {
     const s = scripts.getCurrentArticle();
     expect(s).toContain("set a to current article");
+  });
+
+  it("emits the same field tags as readArticle so a single parser handles both", () => {
+    const s = scripts.getCurrentArticle();
+    for (const tag of [
+      "TITLE",
+      "URL",
+      "FEED",
+      "DATE",
+      "READ",
+      "STARRED",
+      "AUTHORS",
+      "SUMMARY",
+      "HTML",
+      "TEXT",
+    ]) {
+      expect(s).toMatch(new RegExp(`"${tag}" & US`));
+    }
+  });
+
+  it("strips RS/US from user-controlled article fields", () => {
+    const s = scripts.getCurrentArticle();
+    expect(s).toContain("my stripSep(title of a)");
+    expect(s).toContain("my stripSep(html of a)");
+    expect(s).toContain("my stripSep(contents of a)");
+    expect(s).toContain("my stripSep(name of feed of a)");
   });
 });

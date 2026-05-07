@@ -56,9 +56,28 @@ Then add to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 | `list_feeds` | List all subscribed feeds and folders, optionally filtered by account |
 | `get_articles` | Fetch articles with filters: unread, starred, by feed/folder, with limit |
 | `read_article` | Get full article content (HTML, text, metadata) by article ID |
+| `get_current_article` | Get the article currently selected/displayed in NetNewsWire's UI |
 | `mark_articles` | Mark articles as read/unread/starred/unstarred (batch support) |
 | `subscribe` | Subscribe to a new RSS/Atom feed by URL |
 | `search_articles` | Search articles by keyword across all feeds |
+| `create_folder` | Create a new folder in an account |
+| `delete_folder` | Delete a folder (refuses if it still contains feeds) |
+| `delete_feed` | Unsubscribe from a feed by URL |
+| `move_feed` | Move a feed into a folder, or to the account's top level |
+| `export_opml` | Export OPML for a feed, folder, or whole account |
+
+> **Note on `move_feed`:** NetNewsWire's AppleScript dictionary doesn't expose a
+> `move` verb and feed properties are read-only, so moves are implemented as
+> delete-then-resubscribe within the same account. On On-My-Mac accounts this
+> may lose locally-stored read/star state for the moved feed; sync accounts
+> (Feedbin/Feedly/etc.) re-hydrate from the service. Renaming feeds and folders
+> isn't supported because their `name` properties are read-only in the
+> scripting dictionary.
+>
+> **Note on OPML import:** Only export is provided. NetNewsWire's scripting
+> dictionary doesn't expose an import verb, so a faithful import would have to
+> parse OPML in JS and subscribe feed-by-feed — slow on large dumps and not
+> shipped here.
 
 ## Example Workflow
 

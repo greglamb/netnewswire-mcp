@@ -29,7 +29,12 @@ export async function runAppleScript(
   } catch (error: unknown) {
     const msg =
       error instanceof Error ? error.message : String(error);
-    if (msg.includes("not running") || msg.includes("-600")) {
+    // Classify by Apple Event error code only (-600 = application not
+    // running). Avoid substring-matching the human-readable error message
+    // — that text is localized, so an English check fails on a French or
+    // Japanese system and the user gets the generic "AppleScript error"
+    // instead of the actionable not-running message.
+    if (msg.includes("-600")) {
       throw new Error(
         "NetNewsWire is not running. Please launch NetNewsWire and try again."
       );

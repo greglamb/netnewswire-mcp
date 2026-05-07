@@ -1,13 +1,26 @@
 import { describe, it, expect } from "vitest";
 import { parseListFeeds, parseArticles, parseFullArticle } from "./parsers.js";
+import { RS, US } from "./applescript/protocol.js";
+
+/**
+ * Test helpers for building raw payloads in the new wire format.
+ *
+ * The previous protocol used `|` to delimit fields and `\n` to terminate
+ * records, which silently mangled article titles like "Foo | Bar" and any
+ * field containing a newline. These helpers exercise the new RS/US format
+ * AND the specific cases that broke under the old format, so the
+ * regression doesn't sneak back in.
+ */
+function record(...fields: string[]): string {
+  return fields.join(US) + RS;
+}
 
 describe("parseListFeeds", () => {
   it("parses accounts with top-level feeds", () => {
-    const raw = [
-      "ACCOUNT:iCloud|true",
-      "FEED:My Blog|https://example.com/feed.xml|https://example.com",
-      "FEED:Other Feed|https://other.com/rss|",
-    ].join("\n");
+    const raw =
+      record("ACCOUNT", "iCloud", "true") +
+      record("FEED", "My Blog", "https://example.com/feed.xml", "https://example.com") +
+      record("FEED", "Other Feed", "https://other.com/rss", "");
 
     const result = parseListFeeds(raw);
     expect(result).toEqual([
@@ -24,13 +37,12 @@ describe("parseListFeeds", () => {
   });
 
   it("parses folders with nested feeds", () => {
-    const raw = [
-      "ACCOUNT:On My Mac|true",
-      "FOLDER:Tech",
-      "FEED:Hacker News|https://hn.com/rss|https://hn.com",
-      "FOLDER:News",
-      "FEED:BBC|https://bbc.com/rss|https://bbc.com",
-    ].join("\n");
+    const raw =
+      record("ACCOUNT", "On My Mac", "true") +
+      record("FOLDER", "Tech") +
+      record("FEED", "Hacker News", "https://hn.com/rss", "https://hn.com") +
+      record("FOLDER", "News") +
+      record("FEED", "BBC", "https://bbc.com/rss", "https://bbc.com");
 
     const result = parseListFeeds(raw);
     expect(result[0]!.feeds).toEqual([]);
@@ -42,12 +54,11 @@ describe("parseListFeeds", () => {
   });
 
   it("parses multiple accounts", () => {
-    const raw = [
-      "ACCOUNT:iCloud|true",
-      "FEED:Feed A|https://a.com/rss|",
-      "ACCOUNT:Feedbin|false",
-      "FEED:Feed B|https://b.com/rss|",
-    ].join("\n");
+    const raw =
+      record("ACCOUNT", "iCloud", "true") +
+      record("FEED", "Feed A", "https://a.com/rss", "") +
+      record("ACCOUNT", "Feedbin", "false") +
+      record("FEED", "Feed B", "https://b.com/rss", "");
 
     const result = parseListFeeds(raw);
     expect(result).toHaveLength(2);
@@ -60,14 +71,60 @@ describe("parseListFeeds", () => {
   it("handles empty input", () => {
     expect(parseListFeeds("")).toEqual([]);
   });
+
+  // ── Robustness regressions ───────────────────────────────────────
+  it("preserves a literal `|` inside a feed name", () => {
+    // The old pipe-delimited format split this name across two parts and
+    // shifted url/homepage into wrong slots. The new format must round-
+    // trip it cleanly.
+    const raw =
+      record("ACCOUNT", "iCloud", "true") +
+      record("FEED", "Foo | Bar Magazine", "https://example.com/rss", "");
+
+    const result = parseListFeeds(raw);
+    expect(result[0]!.feeds[0]!.name).toBe("Foo | Bar Magazine");
+    expect(result[0]!.feeds[0]!.url).toBe("https://example.com/rss");
+  });
+
+  it("preserves a literal newline inside a feed name", () => {
+    // The old format used \n to terminate records, so a newline in a
+    // feed name silently truncated the FEED line. The new format uses
+    // RS for record termination.
+    const raw =
+      record("ACCOUNT", "iCloud", "true") +
+      record("FEED", "Multiline\nName", "https://example.com/rss", "");
+
+    const result = parseListFeeds(raw);
+    expect(result[0]!.feeds[0]!.name).toBe("Multiline\nName");
+    expect(result[0]!.feeds[0]!.url).toBe("https://example.com/rss");
+  });
 });
 
 describe("parseArticles", () => {
   it("parses article list", () => {
-    const raw = [
-      "ARTICLE:id-1|My Article|https://example.com/post|false|true|March 1, 2026|My Blog|A summary",
-      "ARTICLE:id-2|Another|https://example.com/other|true|false|March 2, 2026|Other Feed|",
-    ].join("\n");
+    const raw =
+      record(
+        "ARTICLE",
+        "id-1",
+        "My Article",
+        "https://example.com/post",
+        "false",
+        "true",
+        "March 1, 2026",
+        "My Blog",
+        "A summary"
+      ) +
+      record(
+        "ARTICLE",
+        "id-2",
+        "Another",
+        "https://example.com/other",
+        "true",
+        "false",
+        "March 2, 2026",
+        "Other Feed",
+        ""
+      );
 
     const result = parseArticles(raw);
     expect(result).toEqual([
@@ -94,8 +151,10 @@ describe("parseArticles", () => {
     ]);
   });
 
-  it("skips non-article lines", () => {
-    const raw = "some junk\nARTICLE:id|title|url|false|false|date|feed|\nmore junk";
+  it("ignores non-ARTICLE records", () => {
+    const raw =
+      record("JUNK", "ignore me") +
+      record("ARTICLE", "id", "title", "url", "false", "false", "date", "feed", "");
     const result = parseArticles(raw);
     expect(result).toHaveLength(1);
     expect(result[0]!.id).toBe("id");
@@ -104,22 +163,62 @@ describe("parseArticles", () => {
   it("handles empty input", () => {
     expect(parseArticles("")).toEqual([]);
   });
+
+  // ── Robustness regressions ───────────────────────────────────────
+  it("preserves a `|` inside an article title", () => {
+    // Real-world: site-suffix titles like "Headline | Publication".
+    // Under the old protocol this corrupted url/read/starred slots.
+    const raw = record(
+      "ARTICLE",
+      "id",
+      "Headline | Publication",
+      "https://example.com/post",
+      "false",
+      "true",
+      "March 1, 2026",
+      "Pub",
+      ""
+    );
+    const a = parseArticles(raw)[0]!;
+    expect(a.title).toBe("Headline | Publication");
+    expect(a.url).toBe("https://example.com/post");
+    expect(a.read).toBe(false);
+    expect(a.starred).toBe(true);
+  });
+
+  it("preserves a newline inside an article summary", () => {
+    // Under the old protocol the summary was truncated at the first \n
+    // and the rest of the record dropped on the floor.
+    const summary = "Line one\nLine two\nLine three";
+    const raw = record(
+      "ARTICLE",
+      "id",
+      "title",
+      "url",
+      "false",
+      "false",
+      "date",
+      "feed",
+      summary
+    );
+    const a = parseArticles(raw)[0]!;
+    expect(a.summary).toBe(summary);
+  });
 });
 
 describe("parseFullArticle", () => {
   it("parses full article with all fields", () => {
-    const raw = [
-      "TITLE:My Article",
-      "URL:https://example.com/post",
-      "FEED:My Blog",
-      "DATE:March 1, 2026",
-      "READ:false",
-      "STARRED:true",
-      "AUTHORS:John, Jane, ",
-      "SUMMARY:A brief summary",
-      "HTML:<p>Hello world</p>",
-      "TEXT:Hello world",
-    ].join("\n");
+    const raw =
+      record("TITLE", "My Article") +
+      record("URL", "https://example.com/post") +
+      record("FEED", "My Blog") +
+      record("DATE", "March 1, 2026") +
+      record("READ", "false") +
+      record("STARRED", "true") +
+      record("AUTHORS", "John, Jane, ") +
+      record("SUMMARY", "A brief summary") +
+      record("HTML", "<p>Hello world</p>") +
+      record("TEXT", "Hello world");
 
     const result = parseFullArticle(raw);
     expect(result).toEqual({
@@ -136,25 +235,15 @@ describe("parseFullArticle", () => {
     });
   });
 
-  it("handles multiline HTML content", () => {
-    const raw = [
-      "TITLE:Post",
-      "URL:https://example.com",
-      "FEED:Blog",
-      "DATE:",
-      "READ:true",
-      "STARRED:false",
-      "AUTHORS:",
-      "SUMMARY:",
-      "HTML:<div>",
-      "  <p>Line 1</p>",
-      "  <p>Line 2</p>",
-      "</div>",
-      "TEXT:Line 1 Line 2",
-    ].join("\n");
+  it("preserves multi-line HTML content", () => {
+    const html = "<div>\n  <p>Line 1</p>\n  <p>Line 2</p>\n</div>";
+    const raw =
+      record("TITLE", "Post") +
+      record("HTML", html) +
+      record("TEXT", "Line 1 Line 2");
 
     const result = parseFullArticle(raw);
-    expect(result.html).toBe("<div>\n  <p>Line 1</p>\n  <p>Line 2</p>\n</div>");
+    expect(result.html).toBe(html);
     expect(result.text).toBe("Line 1 Line 2");
   });
 
@@ -163,5 +252,37 @@ describe("parseFullArticle", () => {
     expect(result.title).toBe("");
     expect(result.read).toBe(false);
     expect(result.starred).toBe(false);
+  });
+
+  // ── Robustness regression — the headline reason for the rewrite ──
+  it("does NOT misinterpret a `URL:` line inside HTML body as a new field", () => {
+    // The old parser used a line-prefix regex (`^URL:`) to detect
+    // boundaries, so any HTML line starting with "URL:" silently
+    // overwrote the real URL. Common in tutorials / linkdumps.
+    const html = '<p>See the <a href="https://example.com/x">link</a> for more.</p>\nURL: pretend this is a field\n<p>more body</p>';
+    const raw =
+      record("TITLE", "Real title") +
+      record("URL", "https://real.example.com/post") +
+      record("HTML", html) +
+      record("TEXT", "Real body text");
+
+    const result = parseFullArticle(raw);
+    // The real URL must NOT have been overwritten by the HTML body's
+    // `URL: pretend...` line.
+    expect(result.url).toBe("https://real.example.com/post");
+    // The HTML body must include its own `URL:` line verbatim.
+    expect(result.html).toContain("URL: pretend this is a field");
+    expect(result.html).toBe(html);
+  });
+
+  it("does NOT misinterpret a `READ:` line inside text as the read flag", () => {
+    const text = "First paragraph.\nREAD: see also https://other.example\nSecond paragraph.";
+    const raw =
+      record("READ", "true") +
+      record("TEXT", text);
+
+    const result = parseFullArticle(raw);
+    expect(result.read).toBe(true);
+    expect(result.text).toBe(text);
   });
 });
