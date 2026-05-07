@@ -323,9 +323,14 @@ end tell`;
    * the first account is used (and folder lookups walk every account, which
    * is ambiguous if two accounts have folders with the same name).
    *
-   * NetNewsWire fetches the feed asynchronously, so a successful return
-   * here does NOT mean the URL was a valid feed — only that NNW accepted
-   * it. Callers should hedge their success messaging accordingly.
+   * IMPORTANT: NetNewsWire 7.0.5's AppleScript implementation silently
+   * no-ops `make new feed ... with properties {url: ...}` because `url` is
+   * declared read-only in the sdef. The working form is `with data "URL"`,
+   * verified live. Folders go through `with properties {name: ...}` and
+   * work fine — feeds need this URL-as-data idiom specifically.
+   *
+   * NetNewsWire still fetches the feed asynchronously, so a successful
+   * return here means NNW accepted the request, not that it's a real feed.
    */
   subscribe: (
     feedUrl: string,
@@ -346,7 +351,7 @@ tell application "NetNewsWire"
   repeat with acct in ${accountScope}
     repeat with fld in every folder of acct
       if name of fld is "${folder}" then
-        make new feed at fld with properties {url:"${url}"}
+        make new feed at fld with data "${url}"
         set folderFound to true
         return "OK"
       end if
@@ -363,7 +368,7 @@ end tell`;
 tell application "NetNewsWire"
   set acctFound to false
   repeat with acct in every account whose name is "${account}"
-    make new feed at acct with properties {url:"${url}"}
+    make new feed at acct with data "${url}"
     set acctFound to true
     return "OK"
   end repeat
@@ -375,7 +380,7 @@ end tell`;
 
     return `
 tell application "NetNewsWire"
-  make new feed at first account with properties {url:"${url}"}
+  make new feed at first account with data "${url}"
   return "OK"
 end tell`;
   },
@@ -482,6 +487,11 @@ end tell`;
    * user doesn't accidentally lose feeds; callers are expected to move or
    * delete contained feeds first.
    *
+   * Uses whose-clause delete on the folder collection. A direct
+   * `delete fld` on a captured iterator reference silently no-ops in
+   * NetNewsWire 7.0.5 — same root cause as the feed deletion bug.
+   * Verified live: `delete fld` returned OK but the folder remained.
+   *
    * Returns "OK" on success, "ERROR:Folder not found", or
    * "ERROR:Folder not empty (N feeds)" when the folder still contains feeds.
    * When accountName is given, only that account is searched.
@@ -494,16 +504,16 @@ end tell`;
     return `
 tell application "NetNewsWire"
   repeat with acct in every account ${accountFilter}
-    repeat with fld in every folder of acct
-      if name of fld is "${fname}" then
-        set feedCount to count of feeds of fld
-        if feedCount > 0 then
-          return "ERROR:Folder not empty (" & feedCount & " feeds)"
-        end if
-        delete fld
-        return "OK"
+    set matches to (every folder of acct whose name is "${fname}")
+    if (count of matches) > 0 then
+      set fld to item 1 of matches
+      set feedCount to count of feeds of fld
+      if feedCount > 0 then
+        return "ERROR:Folder not empty (" & feedCount & " feeds)"
       end if
-    end repeat
+      delete (every folder of acct whose name is "${fname}")
+      return "OK"
+    end if
   end repeat
   return "ERROR:Folder not found"
 end tell`;
@@ -513,29 +523,38 @@ end tell`;
    * Delete (unsubscribe from) a feed by URL. Searches both top-level feeds
    * and feeds inside folders across every account.
    *
+   * Uses `delete (every feed of <scope> whose url is "URL")` so NNW
+   * resolves and removes the feed in one atomic step. The previous
+   * iteration-based form hit error -1719 ("Invalid index") when called
+   * back-to-back because NNW's model was still rebuilding from the
+   * prior delete and the iterator's cached indices became stale.
+   *
    * Returns "OK" on success, "ERROR:Feed not found" otherwise.
    */
   deleteFeed: (feedUrl: string) => {
     const url = escapeForAppleScript(feedUrl);
     return `
 tell application "NetNewsWire"
+  set deletedAny to false
   repeat with acct in every account
-    repeat with f in every feed of acct
-      if url of f is "${url}" then
-        delete f
-        return "OK"
+    set topMatches to (every feed of acct whose url is "${url}")
+    if (count of topMatches) > 0 then
+      delete topMatches
+      set deletedAny to true
+    end if
+    repeat with fld in every folder of acct
+      set folderMatches to (every feed of fld whose url is "${url}")
+      if (count of folderMatches) > 0 then
+        delete folderMatches
+        set deletedAny to true
       end if
     end repeat
-    repeat with fld in every folder of acct
-      repeat with f in every feed of fld
-        if url of f is "${url}" then
-          delete f
-          return "OK"
-        end if
-      end repeat
-    end repeat
   end repeat
-  return "ERROR:Feed not found"
+  if deletedAny then
+    return "OK"
+  else
+    return "ERROR:Feed not found"
+  end if
 end tell`;
   },
 
@@ -575,39 +594,56 @@ end tell`;
   end if`
       : "";
 
+    // `with data` (not `with properties {url: ...}`) is required — see
+    // the subscribe handler for the rationale.
     const reSubscribe = targetFolderName
-      ? `make new feed at targetFolder with properties {url:"${url}"}`
-      : `make new feed at srcAcct with properties {url:"${url}"}`;
+      ? `make new feed at targetFolder with data "${url}"`
+      : `make new feed at srcAcct with data "${url}"`;
 
+    // Locate the feed by URL via `whose` (NNW resolves it natively),
+    // capture the OWNING ACCOUNT, then delete via `whose` again so we
+    // don't hold a captured reference across the delete. NNW's cached
+    // iterator references go stale in surprising ways — verified live
+    // when an earlier captured-reference `delete srcFeed` returned OK
+    // but didn't actually remove the feed.
     return `
 tell application "NetNewsWire"
   set srcAcct to missing value
-  set srcFeed to missing value
   repeat with acct in every account
-    if srcFeed is not missing value then exit repeat
-    repeat with f in every feed of acct
-      if url of f is "${url}" then
-        set srcFeed to f
+    if srcAcct is not missing value then exit repeat
+    if (count of (every feed of acct whose url is "${url}")) > 0 then
+      set srcAcct to acct
+    end if
+    if srcAcct is not missing value then exit repeat
+    repeat with fld in every folder of acct
+      if (count of (every feed of fld whose url is "${url}")) > 0 then
         set srcAcct to acct
         exit repeat
       end if
     end repeat
-    if srcFeed is not missing value then exit repeat
-    repeat with fld in every folder of acct
-      if srcFeed is not missing value then exit repeat
-      repeat with f in every feed of fld
-        if url of f is "${url}" then
-          set srcFeed to f
-          set srcAcct to acct
-          exit repeat
-        end if
-      end repeat
-    end repeat
   end repeat
-  if srcFeed is missing value then
+  if srcAcct is missing value then
     return "ERROR:Feed not found"
   end if${targetLookup}
-  delete srcFeed
+  -- Delete via whose-driven match across both top-level and folders in
+  -- the source account. NNW's captured iterator references go stale
+  -- across model updates, so a delete-by-captured-reference silently
+  -- no-ops — verified live in NetNewsWire 7.0.5.
+  set topHits to (every feed of srcAcct whose url is "${url}")
+  if (count of topHits) > 0 then
+    delete topHits
+  end if
+  repeat with fld in every folder of srcAcct
+    set folderHits to (every feed of fld whose url is "${url}")
+    if (count of folderHits) > 0 then
+      delete folderHits
+    end if
+  end repeat
+  -- Without a brief gap, NetNewsWire's transaction layer treats the
+  -- subsequent make as a duplicate of the just-deleted feed and
+  -- silently no-ops it — the feed disappears entirely. 2 seconds is
+  -- enough for NNW's model to settle (verified live in 7.0.5).
+  delay 2
   ${reSubscribe}
   return "OK"
 end tell`;

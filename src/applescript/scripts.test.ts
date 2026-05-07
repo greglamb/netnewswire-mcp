@@ -339,16 +339,33 @@ describe("scripts.readArticle", () => {
 describe("scripts.subscribe", () => {
   it("subscribes at the first account when no folder or account is given", () => {
     const s = scripts.subscribe("https://example.com/feed.xml");
+    // `with data "URL"` is the form NNW 7.0.5 actually honors —
+    // `with properties {url: "..."}` silently no-ops because feed.url is
+    // read-only in the sdef. Verified live in NetNewsWire.
     expect(s).toContain(
-      'make new feed at first account with properties {url:"https://example.com/feed.xml"}'
+      'make new feed at first account with data "https://example.com/feed.xml"'
     );
+  });
+
+  it("never uses `with properties {url:...}` (silently no-ops in NNW)", () => {
+    // Regression guard for the live-test discovery: any future
+    // refactor that brings back `with properties {url:` will silently
+    // succeed in unit tests but fail to actually subscribe.
+    const variants = [
+      scripts.subscribe("https://example.com/feed.xml"),
+      scripts.subscribe("https://example.com/feed.xml", "Tech"),
+      scripts.subscribe("https://example.com/feed.xml", undefined, "Feedbin"),
+    ];
+    for (const s of variants) {
+      expect(s).not.toContain("with properties {url:");
+    }
   });
 
   it("subscribes inside a named folder when one is given", () => {
     const s = scripts.subscribe("https://example.com/feed.xml", "Tech");
     expect(s).toContain('if name of fld is "Tech"');
     expect(s).toContain(
-      'make new feed at fld with properties {url:"https://example.com/feed.xml"}'
+      'make new feed at fld with data "https://example.com/feed.xml"'
     );
   });
 
@@ -373,7 +390,7 @@ describe("scripts.subscribe", () => {
     );
     expect(s).toContain('every account whose name is "On My Mac"');
     expect(s).toContain(
-      'make new feed at acct with properties {url:"https://example.com/feed.xml"}'
+      'make new feed at acct with data "https://example.com/feed.xml"'
     );
   });
 
@@ -400,7 +417,7 @@ describe("scripts.subscribe", () => {
     expect(s).toContain('every account whose name is "Bad \\"Acct\\""');
     expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
     expect(s).toContain(
-      'make new feed at fld with properties {url:"https://e.com/\\"x\\""}'
+      'make new feed at fld with data "https://e.com/\\"x\\""'
     );
   });
 
@@ -525,9 +542,12 @@ describe("scripts.deleteFolder", () => {
     expect(s).toContain('every account whose name is "On My Mac"');
   });
 
-  it("matches the folder by name", () => {
+  it("matches the folder by name via whose-clause", () => {
+    // Captured-reference `delete fld` silently no-ops in NetNewsWire
+    // 7.0.5, same root cause as the feed deletion bug. The whose-clause
+    // delete on the parent collection is the working pattern.
     const s = scripts.deleteFolder("Tech");
-    expect(s).toContain('if name of fld is "Tech"');
+    expect(s).toContain('every folder of acct whose name is "Tech"');
   });
 
   it("refuses to delete a non-empty folder and reports the feed count", () => {
@@ -535,10 +555,12 @@ describe("scripts.deleteFolder", () => {
     expect(s).toContain("set feedCount to count of feeds of fld");
     expect(s).toContain("if feedCount > 0 then");
     expect(s).toContain('"ERROR:Folder not empty ("');
-    // Critical: the empty-check must precede `delete fld`, otherwise the
-    // refusal is meaningless.
+    // Critical: the empty-check must precede the actual delete,
+    // otherwise the refusal is meaningless.
     const checkIdx = s.indexOf("if feedCount > 0 then");
-    const deleteIdx = s.indexOf("delete fld");
+    const deleteIdx = s.indexOf(
+      'delete (every folder of acct whose name is "Tech")'
+    );
     expect(checkIdx).toBeGreaterThan(-1);
     expect(deleteIdx).toBeGreaterThan(checkIdx);
   });
@@ -550,22 +572,38 @@ describe("scripts.deleteFolder", () => {
 
   it("escapes folder names containing quotes", () => {
     const s = scripts.deleteFolder('Bad "Folder"');
-    expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
+    expect(s).toContain(
+      'every folder of acct whose name is "Bad \\"Folder\\""'
+    );
   });
 });
 
 describe("scripts.deleteFeed", () => {
-  it("matches the feed by URL", () => {
+  it("matches the feed by URL via a whose-clause", () => {
+    // Whose-clause delete is what we ship — the previous per-feed
+    // iteration form hit AppleScript error -1719 ("Invalid index") in
+    // back-to-back deletes because NNW's iterator's cached indices went
+    // stale while NNW rebuilt its model from the prior delete. Verified
+    // live in NetNewsWire 7.0.5.
     const s = scripts.deleteFeed("https://example.com/feed.xml");
-    expect(s).toContain('if url of f is "https://example.com/feed.xml"');
+    expect(s).toContain(
+      'every feed of acct whose url is "https://example.com/feed.xml"'
+    );
+    expect(s).toContain(
+      'every feed of fld whose url is "https://example.com/feed.xml"'
+    );
+  });
+
+  it("does NOT use `repeat with f in every feed` (iterator-invalidation bug)", () => {
+    const s = scripts.deleteFeed("https://example.com/feed.xml");
+    expect(s).not.toMatch(/repeat with f in every feed of acct/);
+    expect(s).not.toMatch(/repeat with f in every feed of fld/);
   });
 
   it("searches both top-level feeds AND feeds inside folders", () => {
-    // A feed-by-URL lookup must cover both locations or we'll silently fail
-    // to delete feeds that happen to live inside a folder.
     const s = scripts.deleteFeed("https://example.com/feed.xml");
-    expect(s).toContain("repeat with f in every feed of acct");
-    expect(s).toContain("repeat with f in every feed of fld");
+    expect(s).toContain("every feed of acct whose url");
+    expect(s).toContain("every feed of fld whose url");
   });
 
   it("returns ERROR:Feed not found when no feed matches", () => {
@@ -575,21 +613,46 @@ describe("scripts.deleteFeed", () => {
 
   it("escapes URLs containing quotes", () => {
     const s = scripts.deleteFeed('https://e.com/"x"');
-    expect(s).toContain('if url of f is "https://e.com/\\"x\\""');
-  });
-
-  it("issues a `delete f` on match", () => {
-    const s = scripts.deleteFeed("https://example.com/feed.xml");
-    expect(s).toContain("delete f");
+    expect(s).toContain(
+      'every feed of acct whose url is "https://e.com/\\"x\\""'
+    );
   });
 });
 
 describe("scripts.moveFeed", () => {
-  it("matches the source feed by URL across both top-level and folders", () => {
+  it("matches the source feed by URL via whose-clause across both scopes", () => {
+    // The previous captured-reference form (`set srcFeed to f` inside
+    // the iteration, then `delete srcFeed`) silently no-op'd because
+    // NNW's reference resolution doesn't survive the model update.
+    // Verified live: move returned OK, but the feed remained in its
+    // original location. Whose-clause is the working pattern.
     const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
-    expect(s).toContain('if url of f is "https://example.com/feed.xml"');
-    expect(s).toContain("repeat with f in every feed of acct");
-    expect(s).toContain("repeat with f in every feed of fld");
+    expect(s).toContain(
+      'every feed of acct whose url is "https://example.com/feed.xml"'
+    );
+    expect(s).toContain(
+      'every feed of fld whose url is "https://example.com/feed.xml"'
+    );
+  });
+
+  it("never uses a captured iterator reference for the delete", () => {
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).not.toContain("delete srcFeed");
+  });
+
+  it("inserts a delay between delete and make to bypass NNW dedup", () => {
+    // Without a gap between delete and make in the SAME AppleScript,
+    // NetNewsWire treats the subsequent make as a duplicate of the
+    // just-deleted feed and silently no-ops it — the feed disappears
+    // entirely. Verified live in NetNewsWire 7.0.5.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain("delay 2");
+    // The delay must come AFTER the deletes and BEFORE the re-make.
+    const lastDeleteIdx = s.lastIndexOf("delete folderHits");
+    const delayIdx = s.indexOf("delay 2");
+    const makeIdx = s.indexOf("make new feed");
+    expect(lastDeleteIdx).toBeLessThan(delayIdx);
+    expect(delayIdx).toBeLessThan(makeIdx);
   });
 
   it("returns ERROR:Feed not found when the source feed is missing", () => {
@@ -602,7 +665,7 @@ describe("scripts.moveFeed", () => {
     // have already deleted the feed. Order is load-bearing.
     const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
     const targetMissingIdx = s.indexOf('"ERROR:Target folder not found"');
-    const deleteIdx = s.indexOf("delete srcFeed");
+    const deleteIdx = s.indexOf("delete topHits");
     expect(targetMissingIdx).toBeGreaterThan(-1);
     expect(deleteIdx).toBeGreaterThan(-1);
     expect(targetMissingIdx).toBeLessThan(deleteIdx);
@@ -619,22 +682,30 @@ describe("scripts.moveFeed", () => {
     const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
     expect(s).toContain('if name of fld is "Tech"');
     expect(s).toContain(
-      'make new feed at targetFolder with properties {url:"https://example.com/feed.xml"}'
+      'make new feed at targetFolder with data "https://example.com/feed.xml"'
     );
   });
 
   it("re-subscribes at the account top level when no target folder is given", () => {
     const s = scripts.moveFeed("https://example.com/feed.xml");
     expect(s).toContain(
-      'make new feed at srcAcct with properties {url:"https://example.com/feed.xml"}'
+      'make new feed at srcAcct with data "https://example.com/feed.xml"'
     );
     // And it must NOT try to look up a folder in that case.
     expect(s).not.toContain('if name of fld is ""');
   });
 
+  it("never uses `with properties {url:...}` for the resubscribe", () => {
+    // Same trap as scripts.subscribe — if the resubscribe uses the
+    // properties form, the move appears to succeed (delete worked) but
+    // the feed silently disappears. Live-verified.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).not.toContain("with properties {url:");
+  });
+
   it("escapes URLs and folder names containing quotes", () => {
     const s = scripts.moveFeed('https://e.com/"x"', 'Bad "Folder"');
-    expect(s).toContain('if url of f is "https://e.com/\\"x\\""');
+    expect(s).toContain('every feed of acct whose url is "https://e.com/\\"x\\""');
     expect(s).toContain('if name of fld is "Bad \\"Folder\\""');
   });
 });
