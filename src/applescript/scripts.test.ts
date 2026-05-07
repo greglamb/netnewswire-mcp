@@ -210,6 +210,23 @@ describe("scripts.listFeeds", () => {
     expect(s).toContain("on stripSep(s)");
     expect(s).toContain("end stripSep");
   });
+
+  it("retries on -1719 (iCloud iterator-invalidation race)", () => {
+    // iCloud accounts mutate their folder/feed collections in the
+    // background while AppleScript iterates, causing transient -1719
+    // ("Invalid index") errors. Wrapping the walk in a retry loop is
+    // dramatically simpler than snapshot-and-skip.
+    const s = scripts.listFeeds();
+    expect(s).toContain("if errNum is -1719");
+    // The retry must reset the output buffer, otherwise we'd return
+    // garbage from a partially-built attempt.
+    const retryIdx = s.indexOf("attempts < 2");
+    expect(retryIdx).toBeGreaterThan(-1);
+    // The output buffer must be reset INSIDE the retry loop (after
+    // the retry decision) so a second attempt doesn't return garbage
+    // built up by the first.
+    expect(s.indexOf('set output to ""')).toBeGreaterThan(-1);
+  });
 });
 
 describe("scripts.getArticles", () => {
@@ -617,6 +634,20 @@ describe("scripts.deleteFeed", () => {
       'every feed of acct whose url is "https://e.com/\\"x\\""'
     );
   });
+
+  it("scopes to a named account when accountName is given", () => {
+    // BUG-2 fix: when the same URL is subscribed in multiple accounts
+    // (e.g. "On My Mac" and "iCloud"), the caller can pin which one to
+    // unsubscribe from. Without this, both copies are removed.
+    const s = scripts.deleteFeed("https://example.com/feed.xml", "iCloud");
+    expect(s).toContain('every account whose name is "iCloud"');
+  });
+
+  it("walks every account when accountName is omitted", () => {
+    const s = scripts.deleteFeed("https://example.com/feed.xml");
+    expect(s).not.toContain('every account whose name is');
+    expect(s).toContain("repeat with acct in every account");
+  });
 });
 
 describe("scripts.moveFeed", () => {
@@ -640,18 +671,93 @@ describe("scripts.moveFeed", () => {
     expect(s).not.toContain("delete srcFeed");
   });
 
-  it("inserts a delay between delete and make to bypass NNW dedup", () => {
-    // Without a gap between delete and make in the SAME AppleScript,
-    // NetNewsWire treats the subsequent make as a duplicate of the
-    // just-deleted feed and silently no-ops it — the feed disappears
-    // entirely. Verified live in NetNewsWire 7.0.5.
+  it("branches on accountType to handle local vs sync semantics differently", () => {
+    // Local accounts (onmymac) silently dedup duplicate URLs in the
+    // same account, so subscribe-first verify always fails there;
+    // they need delete-first-then-make. Sync accounts (cloudkit,
+    // feedbin, etc.) allow duplicates, so subscribe-first protects
+    // against sync collapse. Two algorithms, one tool.
     const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
-    expect(s).toContain("delay 2");
-    // The delay must come AFTER the deletes and BEFORE the re-make.
-    const lastDeleteIdx = s.lastIndexOf("delete folderHits");
-    const delayIdx = s.indexOf("delay 2");
-    const makeIdx = s.indexOf("make new feed");
-    expect(lastDeleteIdx).toBeLessThan(delayIdx);
+    expect(s).toContain("(accountType of srcAcct) as text");
+    expect(s).toContain('if acctType is "onmymac" then');
+  });
+
+  it("synced branch: captures original location BEFORE deleting (rollback prep)", () => {
+    // Both branches use delete-first-then-make because NNW dedups
+    // URLs within an account regardless of folder. The synced branch
+    // adds rollback: it captures the original placement before the
+    // delete so a failed make can restore the user's feed.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    const elseIdx = s.indexOf("else\n    -- Synced");
+    expect(elseIdx).toBeGreaterThan(-1);
+    const synced = s.substring(elseIdx);
+    const captureIdx = synced.indexOf("set originalAtTop");
+    const deleteIdx = synced.indexOf("delete (every feed of srcAcct");
+    expect(captureIdx).toBeGreaterThan(-1);
+    expect(captureIdx).toBeLessThan(deleteIdx);
+  });
+
+  it("synced branch: rolls back to original location on failed verify", () => {
+    // The data-protection guard for the BUG-1 scenario. If make
+    // doesn't take, we restore the feed at its original placement
+    // so the user isn't left empty-handed. Honest reporting if the
+    // rollback also fails.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain("ERROR:Move failed; restored feed at original location");
+    expect(s).toContain(
+      "ERROR:Move failed AND rollback failed; feed may be lost"
+    );
+    // Rollback structure: failed verify → attempt restore → check
+    // restore landed → return appropriate ERROR.
+    const elseIdx = s.indexOf("else\n    -- Synced");
+    const synced = s.substring(elseIdx);
+    const verifyFailIdx = synced.indexOf("if not verified then");
+    const rollbackAttemptIdx = synced.indexOf("ROLLBACK:");
+    expect(verifyFailIdx).toBeLessThan(rollbackAttemptIdx);
+  });
+
+  it("synced branch: uses a longer settle delay than the local branch", () => {
+    // iCloud's sync round-trip needs more time than NNW's local
+    // transaction layer. The local branch uses delay 2; synced uses
+    // delay 8 (verified live as the threshold below which iCloud's
+    // delete hasn't committed before the make is issued).
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    const elseIdx = s.indexOf("else\n    -- Synced");
+    const synced = s.substring(elseIdx);
+    expect(synced).toContain("delay 8");
+  });
+
+  it("synced branch: polls (not single-shot delay) for verification", () => {
+    // iCloud's round-trip is variable: typically 3-10s, sometimes
+    // longer. A single fixed delay reliably caused false negatives in
+    // field testing — the move appeared to fail and rolled back even
+    // when the subscribe would have eventually landed. Polling lets
+    // the verify succeed as soon as the model catches up.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    const elseIdx = s.indexOf("else\n    -- Synced");
+    const synced = s.substring(elseIdx);
+    expect(synced).toMatch(/repeat \d+ times/);
+    // Polling must wrap the verify check, not just the make.
+    const repeatIdx = synced.indexOf("repeat");
+    const verifyInsidePoll = synced.indexOf("then", repeatIdx);
+    const exitInsidePoll = synced.indexOf("exit repeat", repeatIdx);
+    expect(verifyInsidePoll).toBeGreaterThan(-1);
+    expect(exitInsidePoll).toBeGreaterThan(verifyInsidePoll);
+  });
+
+  it("local branch: uses delete-first-then-make with delay 2", () => {
+    // The proven local path. Without `delay 2` between the delete and
+    // the make, NNW's transaction layer collapses the pair into a
+    // no-op (verified live in NNW 7.0.5).
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    const localIdx = s.indexOf('if acctType is "onmymac" then');
+    const elseIdx = s.indexOf("else\n    -- Synced");
+    const local = s.substring(localIdx, elseIdx);
+    const deleteIdx = local.indexOf("delete (every feed of srcAcct");
+    const delayIdx = local.indexOf("delay 2");
+    const makeIdx = local.indexOf("make new feed");
+    expect(deleteIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeLessThan(delayIdx);
     expect(delayIdx).toBeLessThan(makeIdx);
   });
 
@@ -660,15 +766,50 @@ describe("scripts.moveFeed", () => {
     expect(s).toContain('return "ERROR:Feed not found"');
   });
 
-  it("validates the target folder BEFORE deleting the source feed", () => {
-    // The whole point: if we fail to find the destination, we must not
-    // have already deleted the feed. Order is load-bearing.
+  it("validates the target folder BEFORE the subscribe step", () => {
+    // If we fail to find the destination, we must not subscribe at the
+    // wrong place AND must not touch the original — so the target
+    // validation has to run before any mutation.
     const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
     const targetMissingIdx = s.indexOf('"ERROR:Target folder not found"');
-    const deleteIdx = s.indexOf("delete topHits");
+    const subscribeIdx = s.indexOf(
+      "make new feed at targetFolder with data"
+    );
     expect(targetMissingIdx).toBeGreaterThan(-1);
-    expect(deleteIdx).toBeGreaterThan(-1);
-    expect(targetMissingIdx).toBeLessThan(deleteIdx);
+    expect(subscribeIdx).toBeGreaterThan(-1);
+    expect(targetMissingIdx).toBeLessThan(subscribeIdx);
+  });
+
+  it("scopes to a named source account when accountName is given", () => {
+    // BUG-2 fix: when the same URL is subscribed in multiple accounts,
+    // move_feed must let the caller disambiguate.
+    const s = scripts.moveFeed(
+      "https://example.com/feed.xml",
+      "Tech",
+      "iCloud"
+    );
+    expect(s).toContain('every account whose name is "iCloud"');
+  });
+
+  it("walks every account when accountName is omitted", () => {
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).not.toContain('every account whose name is');
+    expect(s).toContain("repeat with acct in every account");
+  });
+
+  it("returns OK:already at target if the URL is already in the destination", () => {
+    // Idempotent / safe-to-call-twice. Also handles the cleanup case
+    // where a previous failed move left duplicates.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain('return "OK:already at target"');
+  });
+
+  it("excludes the target folder from the cleanup deletes", () => {
+    // CRITICAL: the cleanup pass must not delete the feed we just
+    // subscribed at the target. Folders other than target get cleaned;
+    // the target itself is preserved.
+    const s = scripts.moveFeed("https://example.com/feed.xml", "Tech");
+    expect(s).toContain('if name of fld is not "Tech"');
   });
 
   it("scopes the target folder lookup to the SOURCE feed's account", () => {

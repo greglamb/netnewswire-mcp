@@ -7,7 +7,8 @@
 // user's existing feeds are not touched.
 //
 // Usage:
-//   node scripts/live-test.mjs
+//   node scripts/live-test.mjs                 # On My Mac (default)
+//   ACCOUNT="iCloud" node scripts/live-test.mjs  # iCloud variant
 //
 // Requires: NetNewsWire running, "On My Mac" account present, automation
 // permission granted to the terminal.
@@ -20,10 +21,18 @@ import {
   parseFullArticle,
 } from "../dist/parsers.js";
 
-const ACCOUNT = "On My Mac";
+const ACCOUNT = process.env.ACCOUNT ?? "On My Mac";
 const FOLDER = "MCP-Live-Test";
 const FEED_A = "https://blog.rust-lang.org/feed.xml";
 const FEED_B = "https://go.dev/blog/feed.atom";
+
+// Sync accounts (iCloud/Feedbin/etc.) take longer to register subscribes
+// because everything round-trips to the service. Local accounts settle
+// within a couple of seconds; iCloud often needs 10-15s.
+const isLocal = ACCOUNT === "On My Mac";
+const SUBSCRIBE_SETTLE_MS = isLocal ? 6000 : 15000;
+const MOVE_SETTLE_MS = isLocal ? 10000 : 20000;
+const FETCH_WAIT_MS = isLocal ? 15000 : 25000;
 
 let passed = 0;
 let failed = 0;
@@ -86,7 +95,7 @@ async function main() {
   step("subscribe FEED_B into folder", r === "OK", `raw=${JSON.stringify(r)}`);
 
   // Give NetNewsWire a moment to register the feeds in its model.
-  await new Promise((res) => setTimeout(res, 6000));
+  await new Promise((res) => setTimeout(res, SUBSCRIBE_SETTLE_MS));
 
   // ── 4. listFeeds shows our new folder + feeds ───────────────────
   const after = parseListFeeds(await run("listFeeds", scripts.listFeeds(ACCOUNT)));
@@ -118,7 +127,7 @@ async function main() {
   // moveFeed has an internal `delay 2` (so NNW doesn't dedup the make
   // against the just-deleted feed). Wait 10s here to let the new
   // top-level feed settle in NNW's model.
-  await new Promise((res) => setTimeout(res, 10000));
+  await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS));
 
   // Verify FEED_A is now at top level
   const afterMove = parseListFeeds(await run("listFeeds", scripts.listFeeds(ACCOUNT)));
@@ -136,7 +145,7 @@ async function main() {
   r = await run("moveFeed FEED_A → folder", scripts.moveFeed(FEED_A, FOLDER));
   step("move_feed back into folder", r === "OK", `raw=${JSON.stringify(r)}`);
 
-  await new Promise((res) => setTimeout(res, 10000));
+  await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS));
 
   // ── 7. move_feed: bad target folder doesn't lose the feed ───────
   r = await run("moveFeed bad target", scripts.moveFeed(FEED_A, "Nonexistent-Folder"));
@@ -160,7 +169,7 @@ async function main() {
   // ── 8. get_articles scoped to folder ────────────────────────────
   // Pull from our test folder. NetNewsWire fetches feeds asynchronously
   // and may take 10-15s on a fresh subscribe before articles appear.
-  await new Promise((res) => setTimeout(res, 15000));
+  await new Promise((res) => setTimeout(res, FETCH_WAIT_MS));
   const arts = parseArticles(
     await run(
       "getArticles",
@@ -215,7 +224,11 @@ async function main() {
   r = await run("deleteFeed FEED_B", scripts.deleteFeed(FEED_B));
   step("delete_feed FEED_B", r === "OK", `raw=${JSON.stringify(r)}`);
 
-  await new Promise((res) => setTimeout(res, 500));
+  // On iCloud the deletes return OK locally but iCloud's eventual
+  // consistency means folder.feeds may still report the old count for
+  // several seconds. Wait longer on synced accounts so the subsequent
+  // delete_folder doesn't hit a stale "folder not empty" error.
+  await new Promise((res) => setTimeout(res, isLocal ? 500 : 8000));
 
   r = await run("deleteFolder empty", scripts.deleteFolder(FOLDER, ACCOUNT));
   step("delete_folder (now empty)", r === "OK", `raw=${JSON.stringify(r)}`);

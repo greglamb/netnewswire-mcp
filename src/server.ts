@@ -11,7 +11,7 @@ import {
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "NetNewsWire",
-    version: "0.2.0",
+    version: "0.2.1",
   });
 
   registerTools(server);
@@ -255,13 +255,22 @@ function registerTools(server: McpServer): void {
   // ── delete_feed ─────────────────────────────────────────────────
   server.tool(
     "delete_feed",
-    "Unsubscribe from a feed by URL. Searches feeds at the account top level and inside folders.",
+    "Unsubscribe from a feed by URL. Searches feeds at the account top level and inside folders. " +
+      "When the same URL is subscribed in multiple accounts, pass `account` to scope the deletion " +
+      "to one of them; otherwise every matching subscription is removed.",
     {
       feedUrl: z.string().url().describe("URL of the feed to unsubscribe from"),
+      account: z
+        .string()
+        .optional()
+        .describe(
+          "Account to scope the deletion to (e.g. 'On My Mac', 'iCloud'). " +
+            "Recommended when the same URL is subscribed in multiple accounts."
+        ),
     },
-    async ({ feedUrl }) => {
+    async ({ feedUrl, account }) => {
       await ensureRunning();
-      const raw = await runAppleScript(scripts.deleteFeed(feedUrl));
+      const raw = await runAppleScript(scripts.deleteFeed(feedUrl, account));
       return handleSentinel(raw, `Unsubscribed from ${feedUrl}.`);
     }
   );
@@ -269,11 +278,13 @@ function registerTools(server: McpServer): void {
   // ── move_feed ───────────────────────────────────────────────────
   server.tool(
     "move_feed",
-    "Move a feed into a folder, or to the top level of its account when no folder is given. " +
-      "Implemented as delete-then-resubscribe within the same account because NetNewsWire's " +
-      "AppleScript dictionary doesn't expose a move verb. The destination is validated before " +
-      "deletion, but be aware that On-My-Mac accounts may lose locally-stored read/star state " +
-      "for the moved feed; sync accounts re-hydrate from the service.",
+    "Move a feed into a folder (or to the top level of its account when no folder is given). " +
+      "Implemented as subscribe-at-target then delete-from-old, with verification between the two " +
+      "steps so a failed re-subscribe never destroys the original. Important caveat for sync " +
+      "accounts (iCloud, Feedbin, etc.): the worst-case failure mode is a leftover duplicate at " +
+      "the original location (recoverable via delete_feed), not data loss. Take an export_opml " +
+      "backup before bulk reorganization. NetNewsWire's AppleScript dictionary does not expose a " +
+      "true move verb, hence this approximation.",
     {
       feedUrl: z.string().url().describe("URL of the feed to move"),
       targetFolder: z
@@ -282,11 +293,42 @@ function registerTools(server: McpServer): void {
         .describe(
           "Destination folder name (must exist in the same account as the feed). Omit to move to the account's top level."
         ),
+      account: z
+        .string()
+        .optional()
+        .describe(
+          "Account to scope the move to (e.g. 'On My Mac', 'iCloud'). " +
+            "Required when the same URL is subscribed in multiple accounts; otherwise the first " +
+            "match wins, which may not be the account containing the target folder."
+        ),
     },
-    async ({ feedUrl, targetFolder }) => {
+    async ({ feedUrl, targetFolder, account }) => {
       await ensureRunning();
-      const raw = await runAppleScript(scripts.moveFeed(feedUrl, targetFolder));
-      const dest = targetFolder ? `into folder "${targetFolder}"` : "to top level";
+      // The synced-account path inside the script can poll up to 20s
+      // for verification. The default 60s subprocess timeout has
+      // headroom but bump explicitly to make the budget visible here.
+      const raw = await runAppleScript(
+        scripts.moveFeed(feedUrl, targetFolder, account),
+        { timeoutMs: 90_000 }
+      );
+      // The script may signal an "already at target" no-op via
+      // OK:already at target / OK:already at top-level — surface that
+      // distinction to the caller so it doesn't look like a phantom
+      // success.
+      if (raw.startsWith("OK:")) {
+        const note = raw.substring(3);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${feedUrl} was ${note} — duplicates elsewhere were cleaned up.`,
+            },
+          ],
+        };
+      }
+      const dest = targetFolder
+        ? `into folder "${targetFolder}"`
+        : "to top level";
       return handleSentinel(raw, `Moved ${feedUrl} ${dest}.`);
     }
   );

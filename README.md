@@ -5,7 +5,7 @@ An MCP server that connects Claude to [NetNewsWire](https://netnewswire.com/) vi
 ## Requirements
 
 - **macOS** (uses AppleScript to communicate with NetNewsWire)
-- **NetNewsWire** must be running
+- **NetNewsWire** must be installed and running — [download](https://netnewswire.com/) · [source on GitHub](https://github.com/Ranchero-Software/NetNewsWire)
 - **Node.js** >= 18.0.0
 
 ## Installation
@@ -67,12 +67,14 @@ Then add to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 | `export_opml` | Export OPML for a feed, folder, or whole account |
 
 > **Note on `move_feed`:** NetNewsWire's AppleScript dictionary doesn't expose a
-> `move` verb and feed properties are read-only, so moves are implemented as
-> delete-then-resubscribe within the same account. On On-My-Mac accounts this
-> may lose locally-stored read/star state for the moved feed; sync accounts
-> (Feedbin/Feedly/etc.) re-hydrate from the service. Renaming feeds and folders
-> isn't supported because their `name` properties are read-only in the
-> scripting dictionary.
+> `move` verb, so moves are implemented as delete-then-resubscribe within the
+> same account. The synced-account path (iCloud, Feedbin, Feedly, etc.) waits
+> longer for the delete to commit through the sync service before issuing the
+> make, then verifies the new subscription registered, and rolls back to the
+> original location if the make doesn't take. On On-My-Mac accounts this may
+> lose locally-stored read/star state for the moved feed; sync accounts
+> re-hydrate from the service. Renaming feeds and folders isn't supported
+> because their `name` properties are read-only in the scripting dictionary.
 >
 > **Note on OPML import:** Only export is provided. NetNewsWire's scripting
 > dictionary doesn't expose an import verb, so a faithful import would have to

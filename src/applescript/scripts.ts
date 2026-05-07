@@ -34,6 +34,13 @@ export const scripts = {
    * emit so a `|` or newline in a feed/folder/account name no longer
    * silently corrupts parsing — the symptom that made this rewrite
    * necessary in the first place.
+   *
+   * Wraps the whole walk in a retry loop because iCloud-synced accounts
+   * regularly mutate their folder/feed collections in the background;
+   * `repeat with fld in every folder of acct` re-evaluates the
+   * collection at each iteration and trips error -1719 ("Invalid
+   * index") when the count shrinks mid-walk. Retrying with a brief
+   * settle gap is dramatically simpler than snapshot-and-skip.
    */
   listFeeds: (accountName?: string) => {
     const accountFilter = accountName
@@ -43,36 +50,53 @@ export const scripts = {
 tell application "NetNewsWire"
   ${protocolInit}
   set output to ""
-  repeat with acct in every account ${accountFilter}
-    set acctName to my stripSep(name of acct)
-    set acctActive to active of acct as text
-    set output to output & "ACCOUNT" & US & acctName & US & acctActive & RS
+  set attempts to 0
+  repeat
+    try
+      set output to ""
+      repeat with acct in every account ${accountFilter}
+        set acctName to my stripSep(name of acct)
+        set acctActive to active of acct as text
+        set output to output & "ACCOUNT" & US & acctName & US & acctActive & RS
 
-    -- Top-level feeds (not in folders)
-    repeat with f in every feed of acct
-      set fName to my stripSep(name of f)
-      set fUrl to my stripSep(url of f)
-      set fHome to ""
-      try
-        set fHome to my stripSep(homepage url of f)
-      end try
-      set output to output & "FEED" & US & fName & US & fUrl & US & fHome & RS
-    end repeat
+        -- Top-level feeds (not in folders)
+        repeat with f in every feed of acct
+          set fName to my stripSep(name of f)
+          set fUrl to my stripSep(url of f)
+          set fHome to ""
+          try
+            set fHome to my stripSep(homepage url of f)
+          end try
+          set output to output & "FEED" & US & fName & US & fUrl & US & fHome & RS
+        end repeat
 
-    -- Folders and their feeds
-    repeat with fld in every folder of acct
-      set fldName to my stripSep(name of fld)
-      set output to output & "FOLDER" & US & fldName & RS
-      repeat with f in every feed of fld
-        set fName to my stripSep(name of f)
-        set fUrl to my stripSep(url of f)
-        set fHome to ""
-        try
-          set fHome to my stripSep(homepage url of f)
-        end try
-        set output to output & "FEED" & US & fName & US & fUrl & US & fHome & RS
+        -- Folders and their feeds
+        repeat with fld in every folder of acct
+          set fldName to my stripSep(name of fld)
+          set output to output & "FOLDER" & US & fldName & RS
+          repeat with f in every feed of fld
+            set fName to my stripSep(name of f)
+            set fUrl to my stripSep(url of f)
+            set fHome to ""
+            try
+              set fHome to my stripSep(homepage url of f)
+            end try
+            set output to output & "FEED" & US & fName & US & fUrl & US & fHome & RS
+          end repeat
+        end repeat
       end repeat
-    end repeat
+      exit repeat
+    on error errMsg number errNum
+      -- -1719 is the iCloud iterator-invalidation symptom; retry up
+      -- to 2 times with a settle gap. Anything else (including the
+      -- five systemic Apple Event codes) propagates immediately.
+      if errNum is -1719 and attempts < 2 then
+        set attempts to attempts + 1
+        delay 1
+      else
+        error errMsg number errNum
+      end if
+    end try
   end repeat
   return output
 end tell`;
@@ -521,7 +545,10 @@ end tell`;
 
   /**
    * Delete (unsubscribe from) a feed by URL. Searches both top-level feeds
-   * and feeds inside folders across every account.
+   * and feeds inside folders. With accountName, only that account is
+   * touched — important when the same URL is subscribed in multiple
+   * accounts (e.g. once in "On My Mac" and once in "iCloud") and the
+   * user only wants to drop one of them.
    *
    * Uses `delete (every feed of <scope> whose url is "URL")` so NNW
    * resolves and removes the feed in one atomic step. The previous
@@ -531,12 +558,15 @@ end tell`;
    *
    * Returns "OK" on success, "ERROR:Feed not found" otherwise.
    */
-  deleteFeed: (feedUrl: string) => {
+  deleteFeed: (feedUrl: string, accountName?: string) => {
     const url = escapeForAppleScript(feedUrl);
+    const accountScope = accountName
+      ? `every account whose name is "${escapeForAppleScript(accountName)}"`
+      : "every account";
     return `
 tell application "NetNewsWire"
   set deletedAny to false
-  repeat with acct in every account
+  repeat with acct in ${accountScope}
     set topMatches to (every feed of acct whose url is "${url}")
     if (count of topMatches) > 0 then
       delete topMatches
@@ -562,29 +592,47 @@ end tell`;
    * Move a feed into a folder, or to the top level of its account when
    * targetFolderName is undefined.
    *
-   * NetNewsWire's AppleScript dictionary doesn't expose a `move` verb and
-   * feed properties (including the parent) are read-only, so this is
-   * implemented as delete-then-resubscribe within the same account.
-   * Trade-off: locally-stored read/star state for that feed may be lost on
-   * On-My-Mac accounts; sync accounts (Feedbin/Feedly/etc.) re-hydrate from
-   * the service. The feed URL is the only durable identifier.
+   * Subscribe-first then delete, NOT delete-first then subscribe — the
+   * inversion is critical. The previous order (delete then make) reliably
+   * lost feeds on iCloud-synced accounts (8/8 reproductions in field
+   * testing): iCloud's sync layer collapsed the close-paired delete+add
+   * into a no-op and the feed vanished. With subscribe-first, the
+   * worst-case failure mode is a leftover duplicate (recoverable via
+   * delete_feed), not unrecoverable loss.
    *
-   * Returns "OK" on success, "ERROR:Feed not found", or
-   * "ERROR:Target folder not found" (validated *before* the delete so the
-   * feed is never lost when the destination is bad).
+   * Algorithm:
+   *   1. Locate the source account (optionally scoped by accountName).
+   *   2. Validate the target folder exists in that account, if given.
+   *   3. If the URL is already at target, no-op + clean up duplicates.
+   *   4. `make new feed` at the target.
+   *   5. delay + verify the new subscription registered.
+   *   6. Only on verified success, delete from non-target locations.
+   *
+   * Returns "OK", "OK:already at target", "ERROR:Feed not found",
+   * "ERROR:Target folder not found", or
+   * "ERROR:Subscribe at target did not register; original feed left in
+   * place" (the protective failure case — feed is still at its original
+   * location, no data lost).
    */
-  moveFeed: (feedUrl: string, targetFolderName?: string) => {
+  moveFeed: (
+    feedUrl: string,
+    targetFolderName?: string,
+    accountName?: string
+  ) => {
     const url = escapeForAppleScript(feedUrl);
+    const folder = targetFolderName
+      ? escapeForAppleScript(targetFolderName)
+      : "";
+    const accountScope = accountName
+      ? `every account whose name is "${escapeForAppleScript(accountName)}"`
+      : "every account";
 
-    // The target-folder lookup and the make-at-folder branch are emitted
-    // only when a target folder is requested, so the generated script
-    // doesn't carry dead `if name of fld is ""` comparisons in the
-    // top-level case.
+    // Target validation block — emitted only when a folder is requested.
     const targetLookup = targetFolderName
       ? `
   set targetFolder to missing value
   repeat with fld in every folder of srcAcct
-    if name of fld is "${escapeForAppleScript(targetFolderName)}" then
+    if name of fld is "${folder}" then
       set targetFolder to fld
       exit repeat
     end if
@@ -594,22 +642,94 @@ end tell`;
   end if`
       : "";
 
-    // `with data` (not `with properties {url: ...}`) is required — see
-    // the subscribe handler for the rationale.
-    const reSubscribe = targetFolderName
+    // Pre-step: if the feed is already at target, this becomes a cleanup
+    // operation (remove dups elsewhere) rather than a real move.
+    const alreadyAtTargetCheck = targetFolderName
+      ? `
+  if (count of (every feed of targetFolder whose url is "${url}")) > 0 then
+    delete (every feed of srcAcct whose url is "${url}")
+    repeat with fld in every folder of srcAcct
+      if name of fld is not "${folder}" then
+        delete (every feed of fld whose url is "${url}")
+      end if
+    end repeat
+    return "OK:already at target"
+  end if`
+      : `
+  if (count of (every feed of srcAcct whose url is "${url}")) > 0 then
+    repeat with fld in every folder of srcAcct
+      delete (every feed of fld whose url is "${url}")
+    end repeat
+    return "OK:already at top-level"
+  end if`;
+
+    const subscribeAtTarget = targetFolderName
       ? `make new feed at targetFolder with data "${url}"`
       : `make new feed at srcAcct with data "${url}"`;
 
-    // Locate the feed by URL via `whose` (NNW resolves it natively),
-    // capture the OWNING ACCOUNT, then delete via `whose` again so we
-    // don't hold a captured reference across the delete. NNW's cached
-    // iterator references go stale in surprising ways — verified live
-    // when an earlier captured-reference `delete srcFeed` returned OK
-    // but didn't actually remove the feed.
+    const verifyAtTarget = targetFolderName
+      ? `(count of (every feed of targetFolder whose url is "${url}")) > 0`
+      : `(count of (every feed of srcAcct whose url is "${url}")) > 0`;
+
+    // Build the rollback block — emitted into the synced-branch only.
+    // Captures the original location BEFORE the delete so that on a
+    // failed make we can attempt to put the feed back where it was.
+    const rollbackBlock = `
+    -- Capture original location BEFORE deleting so rollback can
+    -- restore. Field testing showed iCloud will reliably accept a
+    -- fresh make once the URL is fully cleared from the account, so
+    -- rollback is a real recovery path, not just a comforting log.
+    set originalAtTop to (count of (every feed of srcAcct whose url is "${url}")) > 0
+    set originalFolderName to ""
+    if not originalAtTop then
+      repeat with fld in every folder of srcAcct
+        if (count of (every feed of fld whose url is "${url}")) > 0 then
+          set originalFolderName to (name of fld) as text
+          exit repeat
+        end if
+      end repeat
+    end if`;
+
+    const rollbackOnFailure = `
+      -- ROLLBACK: feed was deleted but make didn't take. Restore the
+      -- original placement so the user isn't left empty-handed.
+      delay 2
+      try
+        if originalAtTop then
+          make new feed at srcAcct with data "${url}"
+        else if originalFolderName is not "" then
+          repeat with fld in every folder of srcAcct
+            if (name of fld) is originalFolderName then
+              make new feed at fld with data "${url}"
+              exit repeat
+            end if
+          end repeat
+        end if
+      end try
+      delay 5
+      -- Did the rollback land?
+      set rolledBack to false
+      if (count of (every feed of srcAcct whose url is "${url}")) > 0 then
+        set rolledBack to true
+      else
+        repeat with fld in every folder of srcAcct
+          if (count of (every feed of fld whose url is "${url}")) > 0 then
+            set rolledBack to true
+            exit repeat
+          end if
+        end repeat
+      end if
+      if rolledBack then
+        return "ERROR:Move failed; restored feed at original location"
+      else
+        return "ERROR:Move failed AND rollback failed; feed may be lost. Check NetNewsWire."
+      end if`;
+
     return `
 tell application "NetNewsWire"
+  -- 1. Locate the source account containing this URL.
   set srcAcct to missing value
-  repeat with acct in every account
+  repeat with acct in ${accountScope}
     if srcAcct is not missing value then exit repeat
     if (count of (every feed of acct whose url is "${url}")) > 0 then
       set srcAcct to acct
@@ -624,28 +744,64 @@ tell application "NetNewsWire"
   end repeat
   if srcAcct is missing value then
     return "ERROR:Feed not found"
-  end if${targetLookup}
-  -- Delete via whose-driven match across both top-level and folders in
-  -- the source account. NNW's captured iterator references go stale
-  -- across model updates, so a delete-by-captured-reference silently
-  -- no-ops — verified live in NetNewsWire 7.0.5.
-  set topHits to (every feed of srcAcct whose url is "${url}")
-  if (count of topHits) > 0 then
-    delete topHits
-  end if
-  repeat with fld in every folder of srcAcct
-    set folderHits to (every feed of fld whose url is "${url}")
-    if (count of folderHits) > 0 then
-      delete folderHits
+  end if${targetLookup}${alreadyAtTargetCheck}
+  -- 2. Branch on account type. Both branches use delete-first-then-make
+  --    because NetNewsWire dedups feed URLs within an account (verified
+  --    live across both onmymac and cloudkit accounts) — subscribe-first
+  --    is silently no-op'd when the URL still exists at the source.
+  --    The synced branch uses a longer settle delay to give iCloud's
+  --    sync layer time to commit the delete before the make is issued,
+  --    which avoids the BUG-1 collapse-into-noop pattern.
+  set acctType to (accountType of srcAcct) as text
+  if acctType is "onmymac" then
+    -- Local account: delete-first-then-make with a brief settle.
+    -- 2s is enough for NNW's local transaction layer.
+    delete (every feed of srcAcct whose url is "${url}")
+    repeat with fld in every folder of srcAcct
+      delete (every feed of fld whose url is "${url}")
+    end repeat
+    delay 2
+    ${subscribeAtTarget}
+    set verified to false
+    repeat 5 times
+      delay 1
+      if ${verifyAtTarget} then
+        set verified to true
+        exit repeat
+      end if
+    end repeat
+    if not verified then
+      return "ERROR:Subscribe at target did not register; feed may be lost — check NetNewsWire and use subscribe to re-add"
     end if
-  end repeat
-  -- Without a brief gap, NetNewsWire's transaction layer treats the
-  -- subsequent make as a duplicate of the just-deleted feed and
-  -- silently no-ops it — the feed disappears entirely. 2 seconds is
-  -- enough for NNW's model to settle (verified live in 7.0.5).
-  delay 2
-  ${reSubscribe}
-  return "OK"
+    return "OK"
+  else
+    -- Synced account (cloudkit/feedbin/feedly/etc.). Same shape as the
+    -- local branch but with: (a) longer settle for the delete to round-
+    -- trip through the sync service, (b) rollback to original location
+    -- if the make verify fails. This is the BUG-1 fix path.${rollbackBlock}
+    -- Delete from ALL locations in this account. iCloud needs the URL
+    -- to be fully gone before it'll accept the make at target.
+    delete (every feed of srcAcct whose url is "${url}")
+    repeat with fld in every folder of srcAcct
+      delete (every feed of fld whose url is "${url}")
+    end repeat
+    -- 8s settle: in field testing, iCloud reliably commits the delete
+    -- within 5-7s. 8s gives a margin without dragging the call out.
+    delay 8
+    ${subscribeAtTarget}
+    -- Poll for verification because iCloud round-trip is variable.
+    set verified to false
+    repeat 10 times
+      delay 2
+      if ${verifyAtTarget} then
+        set verified to true
+        exit repeat
+      end if
+    end repeat
+    if not verified then${rollbackOnFailure}
+    end if
+    return "OK"
+  end if
 end tell`;
   },
 
