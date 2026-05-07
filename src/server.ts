@@ -11,7 +11,7 @@ import {
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "NetNewsWire",
-    version: "0.1.3",
+    version: "0.2.0",
   });
 
   registerTools(server);
