@@ -1,5 +1,7 @@
 # NetNewsWire MCP Server
 
+> **Fork Notice:** This extension is a fork of [NetNewsWire MCP Server](https://github.com/jellllly420/netnewswire-mcp) by Zejun Zhao
+
 An MCP server that connects Claude to [NetNewsWire](https://netnewswire.com/) via AppleScript on macOS. Browse feeds, fetch and search articles, mark as read/starred, and subscribe to new feeds.
 
 ## Requirements
@@ -13,7 +15,7 @@ An MCP server that connects Claude to [NetNewsWire](https://netnewswire.com/) vi
 Build from source:
 
 ```bash
-git clone https://github.com/jellllly420/netnewswire-mcp.git
+git clone https://github.com/greglamb/netnewswire-mcp.git
 cd netnewswire-mcp
 npm install
 npm run build

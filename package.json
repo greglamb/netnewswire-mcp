@@ -1,5 +1,5 @@
 {
-  "name": "@jellllly/netnewswire-mcp",
+  "name": "@greglamb/netnewswire-mcp",
   "version": "0.2.2",
   "description": "MCP server for NetNewsWire — interact with your RSS feeds from Claude",
   "type": "module",
@@ -25,10 +25,24 @@
     "claude",
     "applescript"
   ],
+  "author": {
+    "name": "Greg Lamb",
+    "email": "email@greglamb.dev"
+  },
+  "contributors": [
+    {
+      "name": "Zejun Zhao",
+      "url": "https://github.com/jellllly420"
+    }
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/jellllly420/netnewswire-mcp"
+    "url": "git+https://github.com/greglamb/netnewswire-mcp.git"
   },
+  "bugs": {
+    "url": "https://github.com/greglamb/netnewswire-mcp/issues"
+  },
+  "homepage": "https://github.com/greglamb/netnewswire-mcp#readme",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
