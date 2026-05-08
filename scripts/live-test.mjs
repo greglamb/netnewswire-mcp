@@ -88,13 +88,34 @@ async function main() {
   );
 
   // ── 3. subscribe inside the test folder ─────────────────────────
-  r = await run("subscribe FEED_A", scripts.subscribe(FEED_A, FOLDER, ACCOUNT));
-  step("subscribe FEED_A into folder", r === "OK", `raw=${JSON.stringify(r)}`);
+  // Subscribe now verifies internally — returns "OK:<resolvedUrl>" once
+  // the feed actually registers (or ERROR if it never does), so no
+  // post-subscribe sleep is needed for correctness.
+  r = await run(
+    "subscribe FEED_A",
+    scripts.subscribe(FEED_A, FOLDER, ACCOUNT),
+    { timeoutMs: 90_000 }
+  );
+  step(
+    "subscribe FEED_A into folder",
+    r.startsWith("OK:"),
+    `raw=${JSON.stringify(r)}`
+  );
 
-  r = await run("subscribe FEED_B", scripts.subscribe(FEED_B, FOLDER, ACCOUNT));
-  step("subscribe FEED_B into folder", r === "OK", `raw=${JSON.stringify(r)}`);
+  r = await run(
+    "subscribe FEED_B",
+    scripts.subscribe(FEED_B, FOLDER, ACCOUNT),
+    { timeoutMs: 90_000 }
+  );
+  step(
+    "subscribe FEED_B into folder",
+    r.startsWith("OK:"),
+    `raw=${JSON.stringify(r)}`
+  );
 
-  // Give NetNewsWire a moment to register the feeds in its model.
+  // Brief settle for downstream listFeeds to see the new feeds — the
+  // subscribe verify already confirmed registration, so this is just
+  // padding for sync-account model propagation.
   await new Promise((res) => setTimeout(res, SUBSCRIBE_SETTLE_MS));
 
   // ── 4. listFeeds shows our new folder + feeds ───────────────────

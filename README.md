@@ -41,7 +41,7 @@ Then add to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 | `read_article` | Get full article content (HTML, text, metadata) by article ID |
 | `get_current_article` | Get the article currently selected/displayed in NetNewsWire's UI |
 | `mark_articles` | Mark articles as read/unread/starred/unstarred (batch support) |
-| `subscribe` | Subscribe to a new RSS/Atom feed by URL |
+| `subscribe` | Subscribe to a new RSS/Atom feed by URL (homepage URLs work — NetNewsWire auto-discovers feed links) |
 | `search_articles` | Search articles by keyword across all feeds |
 | `create_folder` | Create a new folder in an account |
 | `delete_folder` | Delete a folder (refuses if it still contains feeds) |
@@ -49,6 +49,15 @@ Then add to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 | `move_feed` | Move a feed into a folder, or to the account's top level |
 | `export_opml` | Export OPML for a feed, folder, or whole account |
 
+> **Note on `subscribe`:** NetNewsWire validates feeds asynchronously and
+> silently drops URLs that fail (404, no discoverable feed link, DNS
+> failure). The tool snapshots the target scope, runs the subscribe, then
+> polls up to 30 seconds for a new URL to appear — so callers see real
+> failures rather than a misleading success. Homepage URLs are accepted
+> because NetNewsWire auto-discovers feed links from `<link rel="alternate">`
+> in `<head>`; the resolved canonical URL is reported in the success
+> response when it differs from the input.
+>
 > **Note on `move_feed`:** NetNewsWire's AppleScript dictionary doesn't expose a
 > `move` verb, so moves are implemented as delete-then-resubscribe within the
 > same account. The synced-account path (iCloud, Feedbin, Feedly, etc.) waits

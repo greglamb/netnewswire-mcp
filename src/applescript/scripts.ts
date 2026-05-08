@@ -353,8 +353,14 @@ end tell`;
    * verified live. Folders go through `with properties {name: ...}` and
    * work fine — feeds need this URL-as-data idiom specifically.
    *
-   * NetNewsWire still fetches the feed asynchronously, so a successful
-   * return here means NNW accepted the request, not that it's a real feed.
+   * NetNewsWire validates feeds asynchronously and silently drops URLs
+   * that fail validation (404, no discoverable feed link, DNS failure).
+   * It also auto-discovers feed URLs from homepage `<link rel="alternate">`
+   * elements, so a homepage URL may resolve to a different canonical URL.
+   * To make both behaviors visible to the caller this script snapshots the
+   * scope's feed URLs, runs `make`, then polls up to 30 seconds for a new
+   * URL to appear. Returns "OK:<resolvedUrl>" on success, or an error if
+   * the feed never registers within the budget.
    */
   subscribe: (
     feedUrl: string,
@@ -365,47 +371,67 @@ end tell`;
     const folder = folderName ? escapeForAppleScript(folderName) : "";
     const account = accountName ? escapeForAppleScript(accountName) : "";
 
+    // Snapshot URLs in `scopeVar`, make the feed, poll for a new URL.
+    // SOH (\x01) bookends each URL in the snapshot string so substring
+    // membership is safe — control chars cannot appear in URLs.
+    const verifyBlock = (scopeVar: string) => `
+        set SOH to (ASCII character 1)
+        set beforeStr to SOH
+        repeat with f in every feed of ${scopeVar}
+          set beforeStr to beforeStr & (url of f as text) & SOH
+        end repeat
+        if beforeStr contains (SOH & "${url}" & SOH) then
+          return "OK:${url}"
+        end if
+        make new feed at ${scopeVar} with data "${url}"
+        set discoveredUrl to ""
+        set elapsed to 0
+        with timeout of 60 seconds
+          repeat while elapsed < 30 and discoveredUrl is ""
+            delay 1
+            set elapsed to elapsed + 1
+            repeat with f in every feed of ${scopeVar}
+              set candidate to (url of f as text)
+              if beforeStr does not contain (SOH & candidate & SOH) then
+                set discoveredUrl to candidate
+                exit repeat
+              end if
+            end repeat
+          end repeat
+        end timeout
+        if discoveredUrl is "" then
+          return "ERROR:Feed did not register within 30s — URL may not be a real feed, may have no discoverable feed link, or may have failed validation"
+        end if
+        return "OK:" & discoveredUrl`;
+
     if (folderName) {
       const accountScope = accountName
         ? `every account whose name is "${account}"`
         : "every account";
       return `
 tell application "NetNewsWire"
-  set folderFound to false
   repeat with acct in ${accountScope}
     repeat with fld in every folder of acct
-      if name of fld is "${folder}" then
-        make new feed at fld with data "${url}"
-        set folderFound to true
-        return "OK"
+      if name of fld is "${folder}" then${verifyBlock("fld")}
       end if
     end repeat
   end repeat
-  if not folderFound then
-    return "ERROR:Folder not found"
-  end if
+  return "ERROR:Folder not found"
 end tell`;
     }
 
     if (accountName) {
       return `
 tell application "NetNewsWire"
-  set acctFound to false
-  repeat with acct in every account whose name is "${account}"
-    make new feed at acct with data "${url}"
-    set acctFound to true
-    return "OK"
+  repeat with acct in every account whose name is "${account}"${verifyBlock("acct")}
   end repeat
-  if not acctFound then
-    return "ERROR:Account not found"
-  end if
+  return "ERROR:Account not found"
 end tell`;
     }
 
     return `
 tell application "NetNewsWire"
-  make new feed at first account with data "${url}"
-  return "OK"
+  set acct to first account${verifyBlock("acct")}
 end tell`;
   },
 

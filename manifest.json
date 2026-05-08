@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "@jellllly/netnewswire-mcp",
   "display_name": "NetNewsWire",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Interact with your NetNewsWire RSS feeds from Claude — summarize articles, manage subscriptions, and stay on top of your reading.",
   "long_description": "An MCP server that connects Claude to NetNewsWire via AppleScript on macOS. Browse feeds, fetch and search articles, mark as read/starred, and subscribe to new feeds. Perfect for daily article summaries and feed management workflows.",
   "author": {
@@ -39,7 +39,7 @@
     },
     {
       "name": "subscribe",
-      "description": "Subscribe to a new RSS feed by URL."
+      "description": "Subscribe to a new RSS/Atom feed. Accepts a direct feed URL or a homepage URL (NetNewsWire auto-discovers feed links). Verifies the feed actually registers within ~30s and reports the resolved canonical URL."
     },
     {
       "name": "search_articles",

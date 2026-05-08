@@ -354,13 +354,14 @@ describe("scripts.readArticle", () => {
 });
 
 describe("scripts.subscribe", () => {
-  it("subscribes at the first account when no folder or account is given", () => {
+  it("binds first account to `acct` when no folder or account is given", () => {
     const s = scripts.subscribe("https://example.com/feed.xml");
     // `with data "URL"` is the form NNW 7.0.5 actually honors —
     // `with properties {url: "..."}` silently no-ops because feed.url is
     // read-only in the sdef. Verified live in NetNewsWire.
+    expect(s).toContain("set acct to first account");
     expect(s).toContain(
-      'make new feed at first account with data "https://example.com/feed.xml"'
+      'make new feed at acct with data "https://example.com/feed.xml"'
     );
   });
 
@@ -438,9 +439,40 @@ describe("scripts.subscribe", () => {
     );
   });
 
-  it("returns the OK sentinel on success", () => {
+  it("returns the resolved URL via OK:<url> after verification", () => {
+    // NetNewsWire validates feeds asynchronously and may resolve a
+    // homepage URL to a different canonical feed URL via auto-discovery.
+    // The verify loop diffs the scope's feed URLs after the make and
+    // emits whichever URL actually landed.
     const s = scripts.subscribe("https://example.com/feed.xml");
-    expect(s).toContain('return "OK"');
+    expect(s).toContain('return "OK:" & discoveredUrl');
+  });
+
+  it("short-circuits with OK:<url> if the URL is already subscribed", () => {
+    // Without this pre-check the verify loop would time out (NNW
+    // dedupes the make against the existing feed, so no new URL
+    // appears) and surface a misleading ERROR for an already-good URL.
+    const s = scripts.subscribe("https://example.com/feed.xml");
+    expect(s).toContain(
+      'if beforeStr contains (SOH & "https://example.com/feed.xml" & SOH)'
+    );
+    expect(s).toContain('return "OK:https://example.com/feed.xml"');
+  });
+
+  it("returns ERROR if the feed never registers within the budget", () => {
+    // NetNewsWire silently drops invalid URLs (404, no discoverable
+    // feed link, DNS failure) after async validation. The verify loop
+    // surfaces this rather than letting the caller see a false success.
+    const s = scripts.subscribe("https://example.com/feed.xml");
+    expect(s).toContain(
+      'return "ERROR:Feed did not register within 30s'
+    );
+  });
+
+  it("polls for at most 30 seconds with a 60s Apple Event timeout", () => {
+    const s = scripts.subscribe("https://example.com/feed.xml");
+    expect(s).toContain("repeat while elapsed < 30");
+    expect(s).toContain("with timeout of 60 seconds");
   });
 });
 

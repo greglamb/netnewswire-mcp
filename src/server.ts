@@ -171,9 +171,15 @@ function registerTools(server: McpServer): void {
   // ── subscribe ───────────────────────────────────────────────────
   server.tool(
     "subscribe",
-    "Subscribe to a new RSS/Atom feed in NetNewsWire. Note: NetNewsWire fetches feeds asynchronously, so a successful response means the URL was accepted, not that it's a valid feed — invalid URLs surface later in NetNewsWire's UI.",
+    "Subscribe to a new RSS/Atom feed in NetNewsWire. NetNewsWire auto-discovers feed URLs from a homepage's `<link rel=\"alternate\">` elements, so you can pass either a homepage URL or a direct feed URL. The tool waits up to ~30 seconds for the feed to register and reports the canonical URL NetNewsWire resolved to. Returns an error if the URL doesn't register (no discoverable feed, 404, DNS failure, etc.) so silent drops don't go unnoticed.",
     {
-      feedUrl: z.string().url().describe("The feed URL to subscribe to"),
+      feedUrl: z
+        .string()
+        .url()
+        .describe(
+          "The feed URL to subscribe to. May be a direct feed URL or a " +
+            "homepage URL — NetNewsWire auto-discovers feed links."
+        ),
       folderName: z
         .string()
         .optional()
@@ -189,8 +195,11 @@ function registerTools(server: McpServer): void {
     },
     async ({ feedUrl, folderName, account }) => {
       await ensureRunning();
+      // 30s polling budget + Apple Event overhead — match the wider
+      // timeout used by move_feed which also verifies after a make.
       const raw = await runAppleScript(
-        scripts.subscribe(feedUrl, folderName, account)
+        scripts.subscribe(feedUrl, folderName, account),
+        { timeoutMs: 90_000 }
       );
       if (raw.startsWith("ERROR:")) {
         return {
@@ -198,16 +207,21 @@ function registerTools(server: McpServer): void {
           isError: true,
         };
       }
+      const resolvedUrl = raw.startsWith("OK:") ? raw.substring(3) : feedUrl;
       const where = folderName
         ? ` in folder "${folderName}"`
         : account
           ? ` in account "${account}"`
           : "";
+      const resolvedNote =
+        resolvedUrl !== feedUrl
+          ? ` (NetNewsWire resolved the feed to ${resolvedUrl})`
+          : "";
       return {
         content: [
           {
             type: "text",
-            text: `Subscribed to ${feedUrl}${where}. NetNewsWire will fetch and validate the feed asynchronously; if the URL isn't a real feed, that surfaces later in NetNewsWire's UI rather than here.`,
+            text: `Subscribed to ${feedUrl}${where}${resolvedNote}.`,
           },
         ],
       };
