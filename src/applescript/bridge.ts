@@ -57,3 +57,38 @@ export async function isNetNewsWireRunning(): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Launch NetNewsWire hidden in the background. `-j` opens the app with no
+ * visible windows; `-g` prevents stealing focus from the user's current
+ * app. Used at MCP server startup so tool calls work without the user
+ * having to remember to start NetNewsWire first.
+ *
+ * Polls `isNetNewsWireRunning` for up to ~5s and waits an extra grace
+ * period for NetNewsWire to finish initialising its AppleScript handler
+ * (the process appears in System Events before NNW is ready to answer
+ * Apple Events). Returns true on successful launch + readiness, false if
+ * the app couldn't be launched (e.g. not installed).
+ */
+export async function launchNetNewsWire(): Promise<boolean> {
+  try {
+    await execFileAsync("open", ["-a", "NetNewsWire", "-j", "-g"], {
+      timeout: 5_000,
+    });
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await isNetNewsWireRunning()) {
+      // The process is alive but NNW may still be loading its model
+      // before the AppleScript handler responds reliably. A small grace
+      // window covers the cold-launch case without slowing the
+      // already-running case (we'd already have returned earlier).
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}

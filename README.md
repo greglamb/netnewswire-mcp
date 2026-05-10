@@ -7,7 +7,7 @@ An MCP server that connects Claude to [NetNewsWire](https://netnewswire.com/) vi
 ## Requirements
 
 - **macOS** (uses AppleScript to communicate with NetNewsWire)
-- **NetNewsWire** must be installed and running — [download](https://netnewswire.com/) · [source on GitHub](https://github.com/Ranchero-Software/NetNewsWire)
+- **NetNewsWire** must be installed — [download](https://netnewswire.com/) · [source on GitHub](https://github.com/Ranchero-Software/NetNewsWire). The server auto-launches NetNewsWire hidden (no window, no focus stolen) when it starts, so you don't have to remember to start the app first.
 - **Node.js** >= 18.0.0
 
 ## Installation
